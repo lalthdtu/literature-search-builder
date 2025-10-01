@@ -25,21 +25,19 @@ import {
   Wrench,
 } from "lucide-react";
 
-/* ================= Types ================= */
-
 type Operator = "AND" | "OR";
 
 type Block = {
   id: string;
   name: string;
-  terms: string[]; // plain strings; interpret as regex if isRegex = true
+  terms: string[];
   isRegex?: boolean;
-  exclude?: boolean; // NOT block
+  exclude?: boolean;
 };
 
 type QueryConfig = {
   blocks: Block[];
-  operators: Operator[]; // operators[i] is between blocks[i] and blocks[i+1]
+  operators: Operator[];
   caseInsensitive: boolean;
   searchFields: {
     title: boolean;
@@ -47,8 +45,6 @@ type QueryConfig = {
     keywords: boolean;
   };
 };
-
-/* ================= Helpers ================= */
 
 const uid = () => Math.random().toString(36).slice(2);
 
@@ -122,7 +118,6 @@ function safeRegExp(pattern: string, flags: string) {
   }
 }
 
-// Minimal BibTeX parsing (tolerant)
 function parseBibtexEntries(text: string) {
   const entries: any[] = [];
   const atIndices: number[] = [];
@@ -244,7 +239,6 @@ function evaluateQueryOnText(_text: string, cfg: QueryConfig) {
     regexes: RegExp[];
   }[];
 
-  // Returns ok + matched blocks + detailed per-field term hits
   return function matchesByFields(
     fields: { title?: string; abstract?: string; keywords?: string },
     selected: { title: boolean; abstract: boolean; keywords: boolean }
@@ -281,7 +275,6 @@ function evaluateQueryOnText(_text: string, cfg: QueryConfig) {
           any = true;
         }
       });
-      // Store details only for *positive* blocks (NOT blocks are diagnostic, not in report)
       if (any && !compiled[cidx].block.exclude)
         detailed[compiled[cidx].name] = perFieldHits;
       return any;
@@ -289,13 +282,11 @@ function evaluateQueryOnText(_text: string, cfg: QueryConfig) {
 
     if (compiled.length === 0) return { ok: true, matchedBlocks, detailed };
 
-    // First block
     const firstHit = blockHitAtLeastOne(0);
     let val = compiled[0].block.exclude ? !firstHit : firstHit;
     if (!compiled[0].block.exclude && firstHit)
       matchedBlocks.push(compiled[0].name);
 
-    // Fold across operators
     for (let i = 0; i < cfg.operators.length && i + 1 < compiled.length; i++) {
       const cidx = i + 1;
       const hit = blockHitAtLeastOne(cidx);
@@ -310,12 +301,10 @@ function evaluateQueryOnText(_text: string, cfg: QueryConfig) {
   };
 }
 
-/* ======== Parse pasted Boolean query into blocks/operators ======== */
 function parseBooleanQuery(input: string) {
   if (!input) return null;
   const s = input.replace(/\s+/g, " ").trim();
 
-  // 1) Split top-level groups by AND
   const groups: string[] = [];
   let buf = "";
   let depth = 0;
@@ -355,7 +344,6 @@ function parseBooleanQuery(input: string) {
       continue;
     }
 
-    // split on standalone AND at top level
     if (depth === 0 && s.slice(i, i + 3).toUpperCase() === "AND") {
       const prev = s[i - 1],
         next = s[i + 3];
@@ -372,21 +360,18 @@ function parseBooleanQuery(input: string) {
   }
   pushGroup();
 
-  // 2) For each group, split top-level ORs into terms
   const blocks: Block[] = [];
   const operators: Operator[] = [];
 
   groups.forEach((group, gi) => {
     let g = group.trim();
 
-    // support NOT prefix (optional)
     let exclude = false;
     if (/^NOT\s+/i.test(g)) {
       exclude = true;
       g = g.replace(/^NOT\s+/i, "").trim();
     }
 
-    // strip outer parentheses
     if (g.startsWith("(") && g.endsWith(")")) g = g.slice(1, -1).trim();
 
     const terms: string[] = [];
@@ -428,7 +413,6 @@ function parseBooleanQuery(input: string) {
         continue;
       }
 
-      // split on standalone OR at top level
       if (depth === 0 && g.slice(i, i + 2).toUpperCase() === "OR") {
         const prev = g[i - 1],
           next = g[i + 2];
@@ -462,8 +446,6 @@ function parseBooleanQuery(input: string) {
 
   return { blocks, operators };
 }
-
-/* ================= App ================= */
 
 export default function App() {
   const [bib, setBib] = useState<string>("");
@@ -519,14 +501,13 @@ export default function App() {
   function computeTermStats(rows: any[]) {
     type Field = "title" | "abstract" | "keywords";
 
-    const overallDocCounts = new Map<string, number>(); // term -> #studies
+    const overallDocCounts = new Map<string, number>();
     const overallFieldCounts: Record<Field, Map<string, number>> = {
       title: new Map(),
       abstract: new Map(),
       keywords: new Map(),
     };
 
-    // block -> term -> { docCount, fields: {title,abstract,keywords} }
     const perBlock: Record<
       string,
       Record<string, { docCount: number; fields: Record<Field, number> }>
@@ -538,9 +519,8 @@ export default function App() {
         Partial<Record<Field, string[]>>
       >;
 
-      // Track "seen" so docCount is per-study (not double-counted if a term appears in multiple fields)
       const seenOverall = new Set<string>();
-      const seenInBlock = new Map<string, Set<string>>(); // block -> terms
+      const seenInBlock = new Map<string, Set<string>>();
 
       for (const [blockName, fields] of Object.entries(mtm)) {
         perBlock[blockName] ||= {};
@@ -549,27 +529,23 @@ export default function App() {
         (["title", "abstract", "keywords"] as Field[]).forEach((f) => {
           const terms = (fields?.[f] || []) as string[];
           for (const term of terms) {
-            // Field-level counts (per study)
             const blk = (perBlock[blockName][term] ||= {
               docCount: 0,
               fields: { title: 0, abstract: 0, keywords: 0 },
             });
             blk.fields[f]++;
 
-            // Per-block docCount (once per study per block+term)
             const seenBlockSet = seenInBlock.get(blockName)!;
             if (!seenBlockSet.has(term)) {
               blk.docCount++;
               seenBlockSet.add(term);
             }
 
-            // Overall field counts
             overallFieldCounts[f].set(
               term,
               (overallFieldCounts[f].get(term) || 0) + 1
             );
 
-            // Overall docCount (once per study per term)
             if (!seenOverall.has(term)) {
               overallDocCounts.set(term, (overallDocCounts.get(term) || 0) + 1);
               seenOverall.add(term);
@@ -600,7 +576,7 @@ export default function App() {
       totalMatchedStudies: rows.length,
       overallTop,
       topByBlock,
-      perBlock, // full structure if you want more UI later
+      perBlock,
       overallFieldCounts: Object.fromEntries(
         (["title", "abstract", "keywords"] as Field[]).map((f) => [
           f,
@@ -616,7 +592,7 @@ export default function App() {
       const entries = parseBibtexEntries(bib);
       const matcher = evaluateQueryOnText(bib, cfg);
 
-      let eligible = 0; // entries with at least one selected field present
+      let eligible = 0;
       let matched = 0;
       const rows: any[] = [];
       const matchedBibEntries: string[] = [];
@@ -651,7 +627,6 @@ export default function App() {
           const doi = (e.doi || "").trim();
           const url = (e.url || (doi ? `https://doi.org/${doi}` : "")).trim();
 
-          // Compact detail string for CSV
           const detailPieces: string[] = [];
           Object.entries(detailed).forEach(([blockName, fields]) => {
             const parts: string[] = [];
@@ -674,7 +649,7 @@ export default function App() {
             URL: url,
             MatchedBlocks: matchedBlocks.join("; "),
             MatchedTermsDetail: detailPieces.join("; "),
-            MatchedTermsMap: detailed, // used for on-screen chips
+            MatchedTermsMap: detailed,
           });
 
           matchedBibEntries.push(buildBibEntry(e));
@@ -823,7 +798,6 @@ export default function App() {
           <TabsContent value="query">
             <Card className="shadow-sm">
               <CardContent className="p-6 grid gap-6">
-                {/* Paste Boolean query and auto-build blocks */}
                 <div className="grid gap-3">
                   <div className="flex items-center justify-between">
                     <Label className="text-base">Paste Boolean Query</Label>
@@ -832,12 +806,10 @@ export default function App() {
                         variant="outline"
                         onClick={() => setQueryString("")}
                       >
-                        {" "}
                         <Trash2 className="h-4 w-4 mr-2" />
                         Clear
                       </Button>
                       <Button onClick={applyPastedQuery}>
-                        {" "}
                         <Filter className="h-4 w-4 mr-2" />
                         Parse to Blocks
                       </Button>
@@ -1103,8 +1075,6 @@ export default function App() {
                     </div>
                   </div>
                 )}
-
-                {/* ===== Term Stats (overall + per block) ===== */}
                 {termStats && (
                   <div className="grid gap-4">
                     <div className="flex items-center justify-between mt-2">
@@ -1112,8 +1082,6 @@ export default function App() {
                         Search-term stats
                       </div>
                     </div>
-
-                    {/* Overall leaders */}
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                       <div className="rounded-2xl border p-4 bg-white shadow-sm">
                         <div className="text-xs text-slate-500">
@@ -1183,7 +1151,6 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Per-block tables */}
                     <div className="grid gap-3">
                       {Object.entries(termStats.topByBlock).map(
                         ([blockName, list]: any) => (
