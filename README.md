@@ -28,7 +28,7 @@ This project is built with Next.js, Tailwind CSS, and shadcn/ui components.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/literature-search-builder.git
+git clone https://github.com/lalthdtu/literature-search-builder.git
 cd literature-search-builder
 
 # Install dependencies
@@ -38,7 +38,7 @@ npm install
 npm run dev
 ```
 
-Open your browser and navigate to `http://localhost:3000`
+Open your browser and navigate to the URL shown in your terminal
 
 ## Usage
 
