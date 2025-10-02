@@ -38,11 +38,11 @@ npm install
 npm run dev
 ```
 
-Open your browser and navigate to the URL shown in your terminal
+Open your browser and go to the URL displayed in your terminal (for example, `http://localhost:3000`; the port may vary).
 
 ## Usage
 
-1. **Open the application** in your browser (default: `http://localhost:3000/literature`)
+1. **Open the application** in your browser
 
 2. **Paste BibTeX** (Tab 1)
    - Copy your BibTeX library entries
