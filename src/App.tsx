@@ -46,6 +46,18 @@ type QueryConfig = {
   };
 };
 
+type RunOutput = {
+  matched: any[];
+  unmatched: any[];
+  report: {
+    total: number;
+    eligible: number;
+    matched: number;
+    unmatched: number;
+  };
+  termStats: any;
+};
+
 const uid = () => Math.random().toString(36).slice(2);
 
 const DEFAULT_CONFIG: QueryConfig = {
@@ -118,10 +130,208 @@ function safeRegExp(pattern: string, flags: string) {
   }
 }
 
+// Replace matches with <mark>…</mark> while safely escaping everything else
+function highlightWithRegex(text: string, re: RegExp) {
+  if (!text) return "";
+  const flags = re.flags.includes("g") ? re.flags : re.flags + "g";
+  const rx = new RegExp(re.source, flags);
+  let out = "";
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = rx.exec(text))) {
+    out += escapeHTML(text.slice(last, m.index));
+    out += `<mark>${escapeHTML(m[0])}</mark>`;
+    last = rx.lastIndex;
+    if (m[0].length === 0) rx.lastIndex++; // avoid infinite loops on zero-width
+  }
+  out += escapeHTML(text.slice(last));
+  return out;
+}
+
+type FieldName = "title" | "abstract" | "keywords";
+
+// Stable color from block name
+function stringHash(s: string) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+// Evenly spaced colors around the wheel
+const GOLDEN_ANGLE = 137.508;
+
+function blockColorByIndex(i: number) {
+  const hue = Math.round((i * GOLDEN_ANGLE) % 360);
+  const bg = `hsl(${hue}, 95%, 80%)`;
+  const border = `hsl(${hue}, 70%, 45%)`;
+  return { bg, border, hue };
+}
+
+// Find the block's index by the display name used in MatchedTermsMap
+function findBlockIndexByName(blockName: string, cfg: QueryConfig) {
+  return cfg.blocks.findIndex(
+    (b, j) => (b.name || `Block ${j + 1}`) === blockName
+  );
+}
+
+// Color resolver that prefers index-based color, falls back to hash for unknown names
+function colorForBlockName(blockName: string, cfg: QueryConfig) {
+  const idx = findBlockIndexByName(blockName, cfg);
+  if (idx >= 0) return blockColorByIndex(idx);
+  const h = stringHash(blockName) % 360; // fallback (rare)
+  return { bg: `hsl(${h}, 95%, 80%)`, border: `hsl(${h}, 70%, 45%)`, hue: h };
+}
+
+function escapeHTML(s: string) {
+  return (s || "").replace(
+    /[&<>"']/g,
+    (ch) =>
+      ((
+        {
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        } as const
+      )[ch]!)
+  );
+}
+
+// Build regex for ONE block + ONE field from the terms that actually hit
+function compileRegexForBlockField(
+  blockCfg: { name?: string; isRegex?: boolean } | undefined,
+  hits: string[] | undefined,
+  caseInsensitive: boolean
+): RegExp | null {
+  if (!blockCfg || !hits?.length) return null;
+  const sortDesc = (a: string, b: string) => b.length - a.length;
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  const source = blockCfg.isRegex
+    ? `(?:${[...hits].sort(sortDesc).join("|")})`
+    : `\\b(?:${[...hits].sort(sortDesc).map(esc).join("|")})\\b`;
+
+  const flags = `g${caseInsensitive ? "i" : ""}`;
+  return new RegExp(source, flags);
+}
+
+type Span = { start: number; end: number; block: string; text: string };
+
+function collectSpans(
+  text: string,
+  arr: Array<{ block: string; re: RegExp }>
+): Span[] {
+  const spans: Span[] = [];
+  for (const { block, re } of arr) {
+    const rx = new RegExp(
+      re.source,
+      re.flags.includes("g") ? re.flags : re.flags + "g"
+    );
+    let m: RegExpExecArray | null;
+    while ((m = rx.exec(text))) {
+      spans.push({
+        start: m.index,
+        end: m.index + m[0].length,
+        block,
+        text: m[0],
+      });
+      if (m[0].length === 0) rx.lastIndex++; // safety
+    }
+  }
+  // Resolve overlaps: earlier start wins; for ties, longer wins
+  spans.sort(
+    (a, b) => a.start - b.start || b.end - b.start - (a.end - a.start)
+  );
+  const picked: Span[] = [];
+  let lastEnd = -1;
+  for (const s of spans) {
+    if (s.start >= lastEnd) {
+      picked.push(s);
+      lastEnd = s.end;
+    }
+  }
+  return picked;
+}
+
+// Highlight one field using per-block regexes (so we can color by block)
+function highlightByBlocks(
+  text: string,
+  matchedTermsMap: Record<string, Partial<Record<FieldName, string[]>>>,
+  cfg: QueryConfig,
+  field: FieldName
+) {
+  if (!text) return "";
+  const perBlock: Array<{ block: string; re: RegExp }> = [];
+
+  for (const [blockName, fields] of Object.entries(matchedTermsMap || {})) {
+    const blockCfg = cfg.blocks.find((b) => (b.name || "") === blockName);
+    const hits = (fields?.[field] || []) as string[];
+    const re = compileRegexForBlockField(blockCfg, hits, !!cfg.caseInsensitive);
+    if (re) perBlock.push({ block: blockName, re });
+  }
+
+  if (!perBlock.length) return escapeHTML(text);
+
+  const spans = collectSpans(text, perBlock);
+  if (!spans.length) return escapeHTML(text);
+
+  let out = "";
+  let pos = 0;
+  for (const s of spans) {
+    const { bg, border } = colorForBlockName(s.block, cfg);
+    out += escapeHTML(text.slice(pos, s.start));
+    out += `<mark class="hl" data-block="${escapeHTML(
+      s.block
+    )}" style="background:${bg};border:1px solid ${border};border-radius:0.25rem;padding:0 0.15em;">${escapeHTML(
+      s.text
+    )}</mark>`;
+    pos = s.end;
+  }
+  out += escapeHTML(text.slice(pos));
+  return out;
+}
+
+// Build a single regex for one field using only the terms that actually matched that field
+function buildHighlightRegexForField(
+  matchedTermsMap: Record<string, Partial<Record<FieldName, string[]>>>,
+  cfg: QueryConfig,
+  field: FieldName
+) {
+  const literal: string[] = [];
+  const regex: string[] = [];
+
+  for (const [blockName, fields] of Object.entries(matchedTermsMap || {})) {
+    const block = cfg.blocks.find((b) => (b.name || "") === blockName);
+    const hits = (fields?.[field] || []) as string[];
+    if (!hits.length) continue;
+    if (block?.isRegex) regex.push(...hits);
+    else literal.push(...hits);
+  }
+
+  if (!literal.length && !regex.length) return null;
+
+  // Longer first to prefer longest match
+  const sortDesc = (a: string, b: string) => b.length - a.length;
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  const literalAlt = literal.length
+    ? `\\b(?:${literal.sort(sortDesc).map(esc).join("|")})\\b`
+    : "";
+  const regexAlt = regex.length ? `(?:${regex.sort(sortDesc).join("|")})` : "";
+
+  const source = [literalAlt, regexAlt].filter(Boolean).join("|");
+  const flags = `g${cfg.caseInsensitive ? "i" : ""}`;
+  return new RegExp(source, flags);
+}
+
 function parseBibtexEntries(text: string) {
   const entries: any[] = [];
   const atIndices: number[] = [];
   for (let i = 0; i < text.length; i++) if (text[i] === "@") atIndices.push(i);
+
+  if (atIndices.length === 0 && text.trim().length > 0) {
+    throw new Error("No BibTeX entries found. Did you forget the '@' symbol?");
+  }
 
   for (let idx = 0; idx < atIndices.length; idx++) {
     const start = atIndices[idx];
@@ -221,7 +431,10 @@ function evaluateQueryOnText(_text: string, cfg: QueryConfig) {
       const regexes = terms.map((t) =>
         b.isRegex
           ? safeRegExp(t, flags)
-          : safeRegExp(t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), flags)
+          : safeRegExp(
+              `\\b${t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
+              flags
+            )
       );
       return {
         index: idx,
@@ -447,16 +660,50 @@ function parseBooleanQuery(input: string) {
   return { blocks, operators };
 }
 
+function BibEntryList({ entries }: { entries: any[] }) {
+  if (!entries || entries.length === 0) {
+    return (
+      <div className="text-sm text-slate-500 py-4 text-center">
+        No entries to display.
+      </div>
+    );
+  }
+  return (
+    <div className="grid gap-3">
+      {entries.map((r, idx) => (
+        <div key={idx} className="rounded-2xl border bg-white p-4 shadow-sm">
+          <div className="text-sm text-slate-500">
+            {r.CiteKey} · {r.Year}
+          </div>
+          <div className="text-lg font-medium leading-snug mt-1">
+            {r.Title || "(No title)"}
+          </div>
+          <div className="text-sm text-slate-600 mt-1">{r.Authors}</div>
+          <div className="text-sm text-slate-600">{r.Venue}</div>
+          {r.URL && (
+            <a
+              className="text-sm text-blue-600 underline mt-1 inline-block"
+              href={r.URL}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Open
+            </a>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function App() {
   const [bib, setBib] = useState<string>("");
   const [cfg, setCfg] = useState<QueryConfig>(DEFAULT_CONFIG);
   const [running, setRunning] = useState(false);
-  const [results, setResults] = useState<any[] | null>(null);
-  const [report, setReport] = useState<any | null>(null);
   const [queryString, setQueryString] = useState<string>("");
   const fileRef = useRef<HTMLInputElement>(null);
-
-  const [termStats, setTermStats] = useState<any | null>(null);
+  const [matchedBib, setMatchedBib] = useState<string>("");
+  const [runOutput, setRunOutput] = useState<RunOutput | null>(null);
 
   const addBlockAt = (index: number) => {
     const nb: Block = {
@@ -588,13 +835,14 @@ export default function App() {
 
   const run = () => {
     setRunning(true);
+    setRunOutput(null);
     try {
       const entries = parseBibtexEntries(bib);
       const matcher = evaluateQueryOnText(bib, cfg);
 
       let eligible = 0;
-      let matched = 0;
-      const rows: any[] = [];
+      const matchedRows: any[] = [];
+      const unmatchedRows: any[] = [];
       const matchedBibEntries: string[] = [];
 
       for (const e of entries) {
@@ -606,6 +854,27 @@ export default function App() {
           (cfg.searchFields.title && title) ||
           (cfg.searchFields.abstract && abstract) ||
           (cfg.searchFields.keywords && keywords);
+
+        const cleanTitle = title
+          .replace(/\s+/g, " ")
+          .replace(/[{}]/g, "")
+          .trim();
+        const authors = (e.author || "").replace(/\s+/g, " ").trim();
+        const year = (e.year || "").trim();
+        const venue = (e.booktitle || e.journal || "")
+          .replace(/\s+/g, " ")
+          .trim();
+        const doi = (e.doi || "").trim();
+        const url = (e.url || (doi ? `https://doi.org/${doi}` : "")).trim();
+        const baseEntry = {
+          CiteKey: e.citekey,
+          Title: cleanTitle,
+          Authors: authors,
+          Year: year,
+          Venue: venue,
+          URL: url,
+        };
+
         if (hasAny) eligible++;
 
         const { ok, matchedBlocks, detailed } = matcher(
@@ -614,19 +883,6 @@ export default function App() {
         );
 
         if (ok && hasAny) {
-          matched++;
-          const cleanTitle = title
-            .replace(/\s+/g, " ")
-            .replace(/[{}]/g, "")
-            .trim();
-          const authors = (e.author || "").replace(/\s+/g, " ").trim();
-          const year = (e.year || "").trim();
-          const venue = (e.booktitle || e.journal || "")
-            .replace(/\s+/g, " ")
-            .trim();
-          const doi = (e.doi || "").trim();
-          const url = (e.url || (doi ? `https://doi.org/${doi}` : "")).trim();
-
           const detailPieces: string[] = [];
           Object.entries(detailed).forEach(([blockName, fields]) => {
             const parts: string[] = [];
@@ -640,32 +896,44 @@ export default function App() {
               detailPieces.push(`${blockName} [${parts.join("; ")}]`);
           });
 
-          rows.push({
-            CiteKey: e.citekey,
-            Title: cleanTitle,
-            Authors: authors,
-            Year: year,
-            Venue: venue,
-            URL: url,
+          matchedRows.push({
+            ...baseEntry,
+            // NEW: raw text to highlight
+            TitleRaw: title,
+            AbstractRaw: abstract,
+            KeywordsRaw: keywords,
+
             MatchedBlocks: matchedBlocks.join("; "),
             MatchedTermsDetail: detailPieces.join("; "),
             MatchedTermsMap: detailed,
           });
 
           matchedBibEntries.push(buildBibEntry(e));
+        } else if (hasAny) {
+          unmatchedRows.push(baseEntry);
         }
       }
 
-      setResults(rows);
-      setReport({
+      const report = {
         total: entries.length,
         eligible,
-        matched,
-        unmatched: Math.max(0, eligible - matched),
+        matched: matchedRows.length,
+        unmatched: unmatchedRows.length,
+      };
+
+      const stats = computeTermStats(matchedRows);
+
+      setRunOutput({
+        matched: matchedRows,
+        unmatched: unmatchedRows,
+        report,
+        termStats: stats,
       });
-      const stats = computeTermStats(rows);
-      setTermStats(stats);
-      (window as any).__matched_bib__ = matchedBibEntries.join("\n\n");
+
+      setMatchedBib(matchedBibEntries.join("\n\n"));
+    } catch (error: any) {
+      alert(`Error processing BibTeX: ${error.message}`);
+      setRunOutput(null);
     } finally {
       setRunning(false);
     }
@@ -705,13 +973,12 @@ export default function App() {
   };
 
   const exportCSV = () => {
-    if (!results || results.length === 0) return;
-    download("matches.csv", toCSV(results), "text/csv");
+    if (!runOutput || runOutput.matched.length === 0) return;
+    download("matches.csv", toCSV(runOutput.matched), "text/csv");
   };
 
   const exportBib = () => {
-    const bibText = (window as any).__matched_bib__ || "";
-    download("matches.bib", bibText, "text/plain");
+    download("matches.bib", matchedBib, "text/plain");
   };
 
   const applyPastedQuery = () => {
@@ -1025,7 +1292,7 @@ export default function App() {
                     <Button
                       variant="outline"
                       onClick={exportCSV}
-                      disabled={!results || results.length === 0}
+                      disabled={!runOutput || runOutput.matched.length === 0}
                     >
                       <Download className="h-4 w-4 mr-2" />
                       Export CSV
@@ -1033,7 +1300,7 @@ export default function App() {
                     <Button
                       variant="outline"
                       onClick={exportBib}
-                      disabled={!results || results.length === 0}
+                      disabled={!runOutput || runOutput.matched.length === 0}
                     >
                       <Download className="h-4 w-4 mr-2" />
                       Export .bib
@@ -1041,14 +1308,14 @@ export default function App() {
                   </div>
                 </div>
 
-                {report && (
+                {runOutput?.report && (
                   <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                     <div className="rounded-2xl border p-4 bg-white shadow-sm">
                       <div className="text-xs text-slate-500">
                         Total entries
                       </div>
                       <div className="text-2xl font-semibold">
-                        {report.total}
+                        {runOutput.report.total}
                       </div>
                     </div>
                     <div className="rounded-2xl border p-4 bg-white shadow-sm">
@@ -1056,13 +1323,13 @@ export default function App() {
                         With selected fields
                       </div>
                       <div className="text-2xl font-semibold">
-                        {report.eligible}
+                        {runOutput.report.eligible}
                       </div>
                     </div>
                     <div className="rounded-2xl border p-4 bg-white shadow-sm">
                       <div className="text-xs text-slate-500">Matched</div>
                       <div className="text-2xl font-semibold">
-                        {report.matched}
+                        {runOutput.report.matched}
                       </div>
                     </div>
                     <div className="rounded-2xl border p-4 bg-white shadow-sm">
@@ -1070,12 +1337,12 @@ export default function App() {
                         Unmatched (with abstract)
                       </div>
                       <div className="text-2xl font-semibold">
-                        {report.unmatched}
+                        {runOutput.report.unmatched}
                       </div>
                     </div>
                   </div>
                 )}
-                {termStats && (
+                {runOutput?.termStats && (
                   <div className="grid gap-4">
                     <div className="flex items-center justify-between mt-2">
                       <div className="text-sm text-slate-700 font-medium">
@@ -1087,11 +1354,12 @@ export default function App() {
                         <div className="text-xs text-slate-500">
                           Top term overall
                         </div>
-                        {termStats.overallTop.length ? (
+                        {runOutput.termStats.overallTop.length ? (
                           <div className="text-lg font-semibold">
-                            {termStats.overallTop[0].term}
+                            {runOutput.termStats.overallTop[0].term}
                             <span className="ml-2 text-slate-500 text-sm">
-                              ({termStats.overallTop[0].docCount} studies)
+                              ({runOutput.termStats.overallTop[0].docCount}{" "}
+                              studies)
                             </span>
                           </div>
                         ) : (
@@ -1108,7 +1376,7 @@ export default function App() {
                           Top 3 terms overall
                         </div>
                         <ul className="mt-1 text-sm">
-                          {termStats.overallTop
+                          {runOutput.termStats.overallTop
                             .slice(0, 3)
                             .map((t: any, i: number) => (
                               <li key={i} className="flex justify-between">
@@ -1129,7 +1397,7 @@ export default function App() {
                           {(["title", "abstract", "keywords"] as const).map(
                             (f) => {
                               const entries = Object.entries(
-                                termStats.overallFieldCounts[f] || {}
+                                runOutput.termStats.overallFieldCounts[f] || {}
                               ).sort(
                                 (a: any, b: any) =>
                                   (b[1] as number) - (a[1] as number)
@@ -1152,7 +1420,7 @@ export default function App() {
                     </div>
 
                     <div className="grid gap-3">
-                      {Object.entries(termStats.topByBlock).map(
+                      {Object.entries(runOutput.termStats.topByBlock).map(
                         ([blockName, list]: any) => (
                           <div
                             key={blockName}
@@ -1192,32 +1460,25 @@ export default function App() {
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {list
-                                    .slice(0, 10)
-                                    .map((t: any, i: number) => (
-                                      <tr key={i} className="border-t">
-                                        <td className="py-2 pr-4">{t.term}</td>
-                                        <td className="py-2 pr-4 tabular-nums">
-                                          {t.docCount}
-                                        </td>
-                                        <td className="py-2 pr-4 tabular-nums">
-                                          {t.fields.title}
-                                        </td>
-                                        <td className="py-2 pr-4 tabular-nums">
-                                          {t.fields.abstract}
-                                        </td>
-                                        <td className="py-2 pr-4 tabular-nums">
-                                          {t.fields.keywords}
-                                        </td>
-                                      </tr>
-                                    ))}
+                                  {list.map((t: any, i: number) => (
+                                    <tr key={i} className="border-t">
+                                      <td className="py-2 pr-4">{t.term}</td>
+                                      <td className="py-2 pr-4 tabular-nums">
+                                        {t.docCount}
+                                      </td>
+                                      <td className="py-2 pr-4 tabular-nums">
+                                        {t.fields.title}
+                                      </td>
+                                      <td className="py-2 pr-4 tabular-nums">
+                                        {t.fields.abstract}
+                                      </td>
+                                      <td className="py-2 pr-4 tabular-nums">
+                                        {t.fields.keywords}
+                                      </td>
+                                    </tr>
+                                  ))}
                                 </tbody>
                               </table>
-                              {list.length > 10 && (
-                                <div className="mt-2 text-xs text-slate-500">
-                                  Showing top 10
-                                </div>
-                              )}
                             </div>
                           </div>
                         )
@@ -1226,96 +1487,226 @@ export default function App() {
                   </div>
                 )}
 
-                {results && (
-                  <div className="grid gap-3">
-                    <div className="text-sm text-slate-600">
-                      {results.length} matching entries
-                    </div>
-                    <div className="grid gap-3">
-                      {results.map((r, idx) => (
-                        <div
-                          key={idx}
-                          className="rounded-2xl border bg-white p-4 shadow-sm"
-                        >
-                          <div className="text-sm text-slate-500">
-                            {r.CiteKey} · {r.Year}
-                          </div>
-                          <div className="text-lg font-medium leading-snug mt-1">
-                            {r.Title || "(No title)"}
-                          </div>
-                          <div className="text-sm text-slate-600 mt-1">
-                            {r.Authors}
-                          </div>
-                          <div className="text-sm text-slate-600">
-                            {r.Venue}
-                          </div>
-                          {r.URL && (
-                            <a
-                              className="text-sm text-blue-600 underline mt-1 inline-block"
-                              href={r.URL}
-                              target="_blank"
-                              rel="noreferrer"
+                {runOutput && (
+                  <Tabs defaultValue="matched" className="mt-4">
+                    <TabsList>
+                      <TabsTrigger value="matched">
+                        Matched ({runOutput.matched.length})
+                      </TabsTrigger>
+                      <TabsTrigger value="unmatched">
+                        Unmatched ({runOutput.unmatched.length})
+                      </TabsTrigger>
+                    </TabsList>
+                    <TabsContent value="matched" className="mt-4">
+                      <div className="grid gap-3">
+                        {runOutput.matched.map((r, idx) => {
+                          // Build field-specific highlight regexes from what actually hit
+                          const titleRe = buildHighlightRegexForField(
+                            r.MatchedTermsMap,
+                            cfg,
+                            "title"
+                          );
+                          const absRe = buildHighlightRegexForField(
+                            r.MatchedTermsMap,
+                            cfg,
+                            "abstract"
+                          );
+                          const kwRe = buildHighlightRegexForField(
+                            r.MatchedTermsMap,
+                            cfg,
+                            "keywords"
+                          );
+
+                          // Render safe HTML with <mark> around matches
+                          const titleHTML = highlightByBlocks(
+                            r.TitleRaw || r.Title || "",
+                            r.MatchedTermsMap,
+                            cfg,
+                            "title"
+                          );
+                          const absHTML = highlightByBlocks(
+                            r.AbstractRaw || "",
+                            r.MatchedTermsMap,
+                            cfg,
+                            "abstract"
+                          );
+                          const kwHTML = highlightByBlocks(
+                            r.KeywordsRaw || "",
+                            r.MatchedTermsMap,
+                            cfg,
+                            "keywords"
+                          );
+
+                          {
+                            r.MatchedTermsMap && (
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                {Object.keys(r.MatchedTermsMap).map((block) => {
+                                  const fields = (r as any).MatchedTermsMap[
+                                    block
+                                  ];
+                                  const hasAny = !!(
+                                    fields?.title?.length ||
+                                    fields?.abstract?.length ||
+                                    fields?.keywords?.length
+                                  );
+                                  if (!hasAny) return null;
+                                  const { bg, border } = colorForBlockName(
+                                    block,
+                                    cfg
+                                  );
+                                  return (
+                                    <span
+                                      key={block}
+                                      className="inline-flex items-center gap-2 rounded-full border px-2 py-0.5 text-xs"
+                                      style={{
+                                        background: bg,
+                                        borderColor: border,
+                                      }}
+                                      title={block}
+                                    >
+                                      <span
+                                        className="inline-block h-2 w-2 rounded-full"
+                                        style={{ background: border }}
+                                      />
+                                      {block}
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            );
+                          }
+
+                          return (
+                            <div
+                              key={idx}
+                              className="rounded-2xl border bg-white p-4 shadow-sm"
                             >
-                              Open
-                            </a>
-                          )}
-
-                          {r.MatchedBlocks && (
-                            <div className="text-xs text-slate-500 mt-2">
-                              Matched blocks: {r.MatchedBlocks}
-                            </div>
-                          )}
-
-                          {r.MatchedTermsMap && (
-                            <div className="mt-2">
-                              <div className="text-xs text-slate-500 mb-1">
-                                Where terms matched (by block & field):
+                              <div className="text-sm text-slate-500">
+                                {r.CiteKey} · {r.Year}
                               </div>
-                              <div className="grid gap-1">
-                                {Object.entries(r.MatchedTermsMap).map(
-                                  ([block, fields]: any, i: number) => (
-                                    <div key={i} className="text-xs">
-                                      <span className="font-medium">
-                                        {block}:
-                                      </span>{" "}
-                                      {["title", "abstract", "keywords"].map(
-                                        (f) =>
-                                          (fields as any)[f]?.length ? (
-                                            <span
-                                              key={f}
-                                              className="inline-block ml-2"
-                                            >
-                                              <span className="uppercase tracking-wide text-slate-500">
-                                                {f}:
-                                              </span>{" "}
-                                              <span className="inline-flex flex-wrap gap-1 align-middle">
-                                                {(fields as any)[f].map(
-                                                  (t: string, j: number) => (
-                                                    <span
-                                                      key={j}
-                                                      className="rounded-full border px-2 py-0.5 bg-slate-50"
-                                                    >
-                                                      {t}
-                                                    </span>
-                                                  )
-                                                )}
+
+                              {/* Title with highlights */}
+                              <div
+                                className="text-lg font-medium leading-snug mt-1"
+                                dangerouslySetInnerHTML={{ __html: titleHTML }}
+                              />
+
+                              <div className="text-sm text-slate-600 mt-1">
+                                {r.Authors}
+                              </div>
+                              <div className="text-sm text-slate-600">
+                                {r.Venue}
+                              </div>
+                              {r.URL && (
+                                <a
+                                  className="text-sm text-blue-600 underline mt-1 inline-block"
+                                  href={r.URL}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
+                                  Open
+                                </a>
+                              )}
+
+                              {r.MatchedBlocks && (
+                                <div className="text-xs text-slate-500 mt-2">
+                                  Matched blocks: {r.MatchedBlocks}
+                                </div>
+                              )}
+
+                              {/* Abstract (if present), with highlights */}
+                              {r.AbstractRaw && (
+                                <div className="mt-3">
+                                  <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">
+                                    Abstract
+                                  </div>
+                                  <p
+                                    className="text-sm text-slate-700 whitespace-pre-line"
+                                    dangerouslySetInnerHTML={{
+                                      __html: absHTML,
+                                    }}
+                                  />
+                                </div>
+                              )}
+
+                              {/* Keywords (if present), with highlights */}
+                              {r.KeywordsRaw && (
+                                <div className="mt-3">
+                                  <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">
+                                    Keywords
+                                  </div>
+                                  <p
+                                    className="text-sm text-slate-700"
+                                    dangerouslySetInnerHTML={{ __html: kwHTML }}
+                                  />
+                                </div>
+                              )}
+
+                              {/* Where terms matched chips (your existing UI) */}
+                              {r.MatchedTermsMap && (
+                                <div className="mt-2">
+                                  <div className="text-xs text-slate-500 mb-1">
+                                    Where terms matched (by block & field):
+                                  </div>
+                                  <div className="grid gap-1">
+                                    {Object.entries(r.MatchedTermsMap).map(
+                                      ([block, fields]: any, i: number) => (
+                                        <div key={i} className="text-xs">
+                                          <span className="font-medium">
+                                            {block}:
+                                          </span>{" "}
+                                          {(
+                                            [
+                                              "title",
+                                              "abstract",
+                                              "keywords",
+                                            ] as const
+                                          ).map((f) =>
+                                            (fields as any)[f]?.length ? (
+                                              <span
+                                                key={f}
+                                                className="inline-block ml-2"
+                                              >
+                                                <span className="uppercase tracking-wide text-slate-500">
+                                                  {f}:
+                                                </span>{" "}
+                                                <span className="inline-flex flex-wrap gap-1 align-middle">
+                                                  {(fields as any)[f].map(
+                                                    (t: string, j: number) => (
+                                                      <span
+                                                        key={j}
+                                                        className="rounded-full border px-2 py-0.5 bg-slate-50"
+                                                      >
+                                                        {t}
+                                                      </span>
+                                                    )
+                                                  )}
+                                                </span>
                                               </span>
-                                            </span>
-                                          ) : null
-                                      )}
-                                    </div>
-                                  )
-                                )}
-                              </div>
+                                            ) : null
+                                          )}
+                                        </div>
+                                      )
+                                    )}
+                                  </div>
+                                </div>
+                              )}
                             </div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
+                          );
+                        })}
+                      </div>
+                    </TabsContent>
+                    <TabsContent value="unmatched" className="mt-4">
+                      <p className="text-sm text-slate-600 mb-4">
+                        These entries had the selected fields for searching
+                        (e.g., abstract) but did not match your query.
+                      </p>
+                      <BibEntryList entries={runOutput.unmatched} />
+                    </TabsContent>
+                  </Tabs>
                 )}
 
-                {!results && (
+                {!runOutput && (
                   <div className="text-sm text-slate-500">
                     Run the query to see a summarized report, search-term stats,
                     and the matching references.
