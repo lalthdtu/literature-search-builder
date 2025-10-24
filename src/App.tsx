@@ -259,16 +259,15 @@ function parseBibtexEntries(text: string) {
     while (j < n) {
       const ch = src[j];
 
-      if (ch === '"' && src[j - 1] !== "\\") {
+      if (ch === '"' && src[j - 1] !== "\\" && depth === 1) {
         inQuote = !inQuote;
         j++;
         continue;
       }
 
       if (!inQuote) {
-        if (ch === "{") {
-          depth++;
-        } else if (ch === "}") {
+        if (ch === "{") depth++;
+        else if (ch === "}") {
           depth--;
           if (depth === 0) {
             j++;
