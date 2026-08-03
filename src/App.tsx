@@ -7,7 +7,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Download, FileText, Filter, Play, Plus, Save, Trash2, Upload, Wrench, CheckCircle, HelpCircle, XCircle } from "lucide-react";
+import { Download, FileText, Filter, Play, Plus, Save, Trash2, Upload, Wrench, CheckCircle, HelpCircle, XCircle, Ban } from "lucide-react";
 
 type Operator = "AND" | "OR";
 
@@ -32,12 +32,14 @@ type QueryConfig = {
 
 type RunOutput = {
   matched: any[];
+  excluded: any[];
   partial: any[];
   unmatched: any[];
   report: {
     total: number;
     eligible: number;
     matched: number;
+    excluded: number;
     partial: number;
     unmatched: number;
   };
@@ -83,6 +85,13 @@ function safeRegExp(pattern: string, flags: string) {
 type FieldName = "title" | "abstract" | "keywords";
 
 function colorForBlockName(name: string, cfg: any) {
+  const block = cfg.blocks.find((b: any, i: number) => (b.name || `Block ${i + 1}`) === name);
+
+  // UX: Distinctive red style for exclusion blocks
+  if (block?.exclude) {
+    return { bg: "#FEF2F2", border: "#EF4444" };
+  }
+
   const idx = Math.max(
     0,
     cfg.blocks.findIndex((b: any, i: number) => (b.name || `Block ${i + 1}`) === name)
@@ -92,7 +101,6 @@ function colorForBlockName(name: string, cfg: any) {
     { bg: "#FDF2F8", border: "#EC4899" },
     { bg: "#ECFDF5", border: "#10B981" },
     { bg: "#FEF3C7", border: "#F59E0B" },
-    { bg: "#FEE2E2", border: "#EF4444" },
     { bg: "#EDE9FE", border: "#8B5CF6" },
   ];
   return palette[idx % palette.length];
@@ -417,7 +425,10 @@ function evaluateQueryOnText(_text: string, cfg: QueryConfig) {
           any = true;
         }
       });
-      if (any && !compiled[cidx].block.exclude) detailed[compiled[cidx].name] = perFieldHits;
+
+      // UX Fix: Always record hits, even if it's an excluded block, so we can show WHY it was excluded.
+      if (any) detailed[compiled[cidx].name] = perFieldHits;
+
       return any;
     };
 
@@ -719,6 +730,7 @@ export default function App() {
       const matchedRows: any[] = [];
       const partialRows: any[] = [];
       const unmatchedRows: any[] = [];
+      const excludedRows: any[] = [];
       const matchedBibEntries: string[] = [];
 
       for (const e of entries) {
@@ -756,7 +768,12 @@ export default function App() {
           if (parts.length) detailPieces.push(`${blockName} [${parts.join("; ")}]`);
         });
 
+        // Identify if a hit was found in an EXCLUDED block
+        const excludedBlockNames = cfg.blocks.filter((b) => b.exclude).map((b) => b.name || "");
+        const hitExcludedBlock = excludedBlockNames.some((name) => detailed[name]);
+
         if (ok && hasAny) {
+          // 1. MATCHED
           matchedRows.push({
             ...baseEntry,
             TitleRaw: title,
@@ -767,7 +784,19 @@ export default function App() {
             MatchedTermsMap: detailed,
           });
           matchedBibEntries.push(buildBibEntry(e));
+        } else if (hasAny && hitExcludedBlock) {
+          // 2. EXCLUDED (Poison Pill hit)
+          excludedRows.push({
+            ...baseEntry,
+            TitleRaw: title,
+            AbstractRaw: abstract,
+            KeywordsRaw: keywords,
+            MatchedTermsMap: detailed,
+            MatchedTermsDetail: detailPieces.join("; "),
+            MatchedBlocks: Object.keys(detailed).join("; "), // These are the blocks that caused exclusion + other partial matches
+          });
         } else if (hasAny && Object.keys(detailed).length > 0) {
+          // 3. PARTIAL (No exclusion hit, but some other blocks matched)
           const allPosBlocks = cfg.blocks.filter((b) => !b.exclude).map((b, j) => b.name || `Block ${j + 1}`);
           const hitBlocks = Object.keys(detailed);
           const missingBlocks = allPosBlocks.filter((n) => !hitBlocks.includes(n));
@@ -783,6 +812,7 @@ export default function App() {
             MissingBlocks: missingBlocks.join("; "),
           });
         } else if (hasAny) {
+          // 4. UNMATCHED
           unmatchedRows.push({
             ...baseEntry,
             TitleRaw: title,
@@ -797,6 +827,7 @@ export default function App() {
         total: entries.length,
         eligible,
         matched: matchedRows.length,
+        excluded: excludedRows.length,
         partial: partialRows.length,
         unmatched: unmatchedRows.length,
       };
@@ -805,6 +836,7 @@ export default function App() {
 
       setRunOutput({
         matched: matchedRows,
+        excluded: excludedRows,
         partial: partialRows,
         unmatched: unmatchedRows,
         report,
@@ -835,6 +867,14 @@ export default function App() {
   year={2023},
   booktitle={Nice Conf},
   abstract={An on-site installation without user study.}
+}
+
+@article{sample3,
+  title={Remote work is great},
+  author={Smith, Bob},
+  year={2022},
+  journal={WFH Today},
+  abstract={We look at remote participation in corporate settings. No VR involved.}
 }`;
     setBib(sample);
   };
@@ -941,7 +981,7 @@ export default function App() {
                       </Button>
                     </div>
                   </div>
-                  <Textarea value={queryString} onChange={(e) => setQueryString(e.target.value)} placeholder={`("virtual reality" OR "immersive virtual reality") AND ("remote study" OR "online study") AND ("participant")`} className="min-h-[120px] font-mono text-sm" />
+                  <Textarea value={queryString} onChange={(e) => setQueryString(e.target.value)} placeholder={`("virtual reality" OR "immersive virtual reality") AND ("remote study" OR "online study") AND NOT ("survey" OR "review")`} className="min-h-[120px] font-mono text-sm" />
                 </div>
 
                 <div className="flex items-center justify-between">
@@ -1005,7 +1045,7 @@ export default function App() {
 
                 <div className="grid gap-4">
                   {cfg.blocks.map((b, i) => (
-                    <div key={b.id} className="rounded-2xl border bg-white shadow-sm p-4">
+                    <div key={b.id} className={`rounded-2xl border shadow-sm p-4 ${b.exclude ? "bg-red-50 border-red-200" : "bg-white"}`}>
                       <div className="flex flex-wrap items-center gap-3 justify-between">
                         <div className="flex items-center gap-3">
                           <Input value={b.name} onChange={(e) => updateBlock(i, { name: e.target.value })} className="w-56" />
@@ -1106,7 +1146,7 @@ export default function App() {
                 </div>
 
                 {runOutput?.report && (
-                  <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                  <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
                     <div className="rounded-2xl border p-4 bg-white shadow-sm">
                       <div className="text-xs text-slate-500">Total entries</div>
                       <div className="text-2xl font-semibold">{runOutput.report.total}</div>
@@ -1115,13 +1155,17 @@ export default function App() {
                       <div className="text-xs text-slate-500">With selected fields</div>
                       <div className="text-2xl font-semibold">{runOutput.report.eligible}</div>
                     </div>
-                    <div className="rounded-2xl border p-4 bg-white shadow-sm">
+                    <div className="rounded-2xl border p-4 bg-white shadow-sm border-l-4 border-l-green-500">
                       <div className="text-xs text-slate-500">Matched</div>
-                      <div className="text-2xl font-semibold">{runOutput.report.matched}</div>
+                      <div className="text-2xl font-semibold text-green-700">{runOutput.report.matched}</div>
                     </div>
-                    <div className="rounded-2xl border p-4 bg-white shadow-sm">
+                    <div className="rounded-2xl border p-4 bg-white shadow-sm border-l-4 border-l-red-500">
+                      <div className="text-xs text-slate-500">Excluded (NOT)</div>
+                      <div className="text-2xl font-semibold text-red-700">{runOutput.report.excluded}</div>
+                    </div>
+                    <div className="rounded-2xl border p-4 bg-white shadow-sm border-l-4 border-l-yellow-500">
                       <div className="text-xs text-slate-500">Partially matched</div>
-                      <div className="text-2xl font-semibold">{runOutput.report.partial}</div>
+                      <div className="text-2xl font-semibold text-yellow-700">{runOutput.report.partial}</div>
                     </div>
                     <div className="rounded-2xl border p-4 bg-white shadow-sm">
                       <div className="text-xs text-slate-500">Unmatched</div>
@@ -1132,7 +1176,7 @@ export default function App() {
                 {runOutput?.termStats && (
                   <div className="grid gap-4">
                     <div className="flex items-center justify-between mt-2">
-                      <div className="text-sm text-slate-700 font-medium">Search-term stats</div>
+                      <div className="text-sm text-slate-700 font-medium">Search-term stats (Matched items only)</div>
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                       <div className="rounded-2xl border p-4 bg-white shadow-sm">
@@ -1228,6 +1272,7 @@ export default function App() {
                   <Tabs defaultValue="matched" className="mt-4">
                     <TabsList>
                       <TabsTrigger value="matched">Matched ({runOutput.matched.length})</TabsTrigger>
+                      <TabsTrigger value="excluded">Excluded ({runOutput.excluded.length})</TabsTrigger>
                       <TabsTrigger value="partial">Partially Matched ({runOutput.partial.length})</TabsTrigger>
                       <TabsTrigger value="unmatched">Unmatched ({runOutput.unmatched.length})</TabsTrigger>
                     </TabsList>
@@ -1240,7 +1285,7 @@ export default function App() {
                           const kwHTML = highlightByBlocks(r.KeywordsRaw || "", r.MatchedTermsMap, cfg, "keywords");
 
                           return (
-                            <div key={idx} className="rounded-2xl border bg-white p-4 shadow-sm">
+                            <div key={idx} className="rounded-2xl border bg-white p-4 shadow-sm border-l-4 border-l-green-500">
                               <div className="text-sm text-slate-500 flex items-center gap-2">
                                 <CheckCircle className="h-4 w-4 text-green-600" aria-label="Matched" />
                                 <span>
@@ -1283,6 +1328,41 @@ export default function App() {
                         })}
                       </div>
                     </TabsContent>
+                    <TabsContent value="excluded" className="mt-4">
+                      <p className="text-sm text-slate-600 mb-4">These entries were excluded because they matched a NOT (Exclude) block.</p>
+                      <div className="grid gap-3">
+                        {runOutput.excluded.map((r: any, idx: number) => {
+                          const titleHTML = highlightByBlocks(r.TitleRaw || r.Title || "", r.MatchedTermsMap || {}, cfg, "title");
+                          const absHTML = highlightByBlocks(r.AbstractRaw || "", r.MatchedTermsMap || {}, cfg, "abstract");
+                          const kwHTML = highlightByBlocks(r.KeywordsRaw || "", r.MatchedTermsMap || {}, cfg, "keywords");
+
+                          return (
+                            <div key={idx} className="rounded-2xl border bg-white p-4 shadow-sm border-l-4 border-l-red-500">
+                              <div className="text-sm text-slate-500 flex items-center gap-2">
+                                <Ban className="h-4 w-4 text-red-600" aria-label="Excluded" />
+                                <span>
+                                  {r.CiteKey} · {r.Year}
+                                </span>
+                              </div>
+
+                              <div className="text-lg font-medium leading-snug mt-1 opacity-75" dangerouslySetInnerHTML={{ __html: titleHTML }} />
+                              <div className="text-sm text-slate-600 mt-1">{r.Authors}</div>
+
+                              <div className="text-xs text-red-600 font-medium mt-2">Excluded due to matches in: {r.MatchedBlocks}</div>
+
+                              {r.AbstractRaw && (
+                                <div className="mt-3 opacity-75">
+                                  <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">Abstract</div>
+                                  <p className="text-sm text-slate-700 whitespace-pre-line" dangerouslySetInnerHTML={{ __html: absHTML }} />
+                                </div>
+                              )}
+
+                              <MatchBreakdown cfg={cfg} matchedMap={r.MatchedTermsMap} caption="excluded terms" />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </TabsContent>
                     <TabsContent value="partial" className="mt-4">
                       <p className="text-sm text-slate-600 mb-4">These entries had some matching terms but did not satisfy the full query.</p>
                       <div className="grid gap-3">
@@ -1292,7 +1372,7 @@ export default function App() {
                           const kwHTML = highlightByBlocks(r.KeywordsRaw || "", r.MatchedTermsMap || {}, cfg, "keywords");
 
                           return (
-                            <div key={idx} className="rounded-2xl border bg-white p-4 shadow-sm">
+                            <div key={idx} className="rounded-2xl border bg-white p-4 shadow-sm border-l-4 border-l-yellow-500">
                               <div className="text-sm text-slate-500 flex items-center gap-2">
                                 <HelpCircle className="h-4 w-4 text-yellow-600" aria-label="Partially Matched" />
                                 <span>
@@ -1346,13 +1426,13 @@ export default function App() {
                           return (
                             <div key={idx} className="rounded-2xl border bg-white p-4 shadow-sm">
                               <div className="text-sm text-slate-500 flex items-center gap-2">
-                                <XCircle className="h-4 w-4 text-red-600" aria-label="Unmatched" />
+                                <XCircle className="h-4 w-4 text-slate-400" aria-label="Unmatched" />
                                 <span>
                                   {r.CiteKey} · {r.Year}
                                 </span>
                               </div>
 
-                              <div className="text-lg font-medium leading-snug mt-1" dangerouslySetInnerHTML={{ __html: titleHTML }} />
+                              <div className="text-lg font-medium leading-snug mt-1 text-slate-600" dangerouslySetInnerHTML={{ __html: titleHTML }} />
 
                               <div className="text-sm text-slate-600 mt-1">{r.Authors}</div>
                               <div className="text-sm text-slate-600">{r.Venue}</div>
