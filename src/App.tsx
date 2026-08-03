@@ -1,1475 +1,472 @@
-import { useRef, useState } from "react";
-import { Card, CardContent } from "@/components/ui/card";
+import { useMemo, useRef, useState } from "react";
+import { AlertTriangle, Check, CheckCircle2, ChevronRight, FileSpreadsheet, FileText, Filter, FolderOpen, Play, Plus, Save, Trash2, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Download, FileText, Filter, Play, Plus, Save, Trash2, Upload, Wrench, CheckCircle, HelpCircle, XCircle, Ban } from "lucide-react";
+import { Textarea } from "@/components/ui/textarea";
+import { BibtexSourceEditor } from "@/components/BibtexSourceEditor";
+import { ResultsPreview, type PreviewBlock } from "@/components/ResultsPreview";
+import { applyBibtexDiagnosticFix, parseBibtex, sourceSignature, type BibtexDiagnostic, type BibtexRecord } from "@/lib/bibtex";
+import {
+  applyDuplicateResolutions,
+  buildUniqueBibtex,
+  findDuplicateGroups,
+  type DuplicateAuditRow,
+  type DuplicateResolution,
+} from "@/lib/deduplication";
+import {
+  applyMetadataRequirements,
+  calculateMetadataFieldCounts,
+  CANONICAL_METADATA_FIELDS,
+  groupMetadataRemovals,
+  METADATA_FIELD_LABELS,
+  type CanonicalMetadataField,
+} from "@/lib/metadata";
+import { parseBlockQuery, type QueryParseError } from "@/lib/queryParser";
+import {
+  classifyBlockResults,
+  createBlockMatcher,
+  type ScreeningRow,
+} from "@/lib/screening";
+import { buildPrismaWorkbook, prismaWorkbookFilename, type WorkbookRunSnapshot } from "@/lib/workbook";
+import {
+  createImportSnapshot,
+  createProjectFile,
+  generateBooleanQuery,
+  importReadiness,
+  normalizeQueryConfig,
+  parseProjectFile,
+  validateQueryConfig,
+  type ImportSnapshot,
+  type ProjectFileV2,
+  type QueryBlock,
+  type QueryConfig,
+  type WorkflowStatus,
+} from "@/lib/workflow";
 
-type Operator = "AND" | "OR";
-
-type Block = {
-  id: string;
-  name: string;
-  terms: string[];
-  isRegex?: boolean;
-  exclude?: boolean;
+type Step = "import" | "dedup" | "metadata" | "query" | "results";
+type RunOutput = WorkbookRunSnapshot & {
+  structurallyValid: number;
+  screenedRecords: BibtexRecord[];
+  duplicateAudit: DuplicateAuditRow[];
+  blocks: PreviewBlock[];
 };
 
-type QueryConfig = {
-  blocks: Block[];
-  operators: Operator[];
-  caseInsensitive: boolean;
-  searchFields: {
-    title: boolean;
-    abstract: boolean;
-    keywords: boolean;
-  };
-};
-
-type RunOutput = {
-  matched: any[];
-  excluded: any[];
-  partial: any[];
-  unmatched: any[];
-  report: {
-    total: number;
-    eligible: number;
-    matched: number;
-    excluded: number;
-    partial: number;
-    unmatched: number;
-  };
-  termStats: any;
-};
-
-const uid = () => Math.random().toString(36).slice(2);
-
+const uid = () => globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2);
 const DEFAULT_CONFIG: QueryConfig = {
   caseInsensitive: true,
   searchFields: { title: true, abstract: true, keywords: true },
   blocks: [
-    {
-      id: uid(),
-      name: "Group 1",
-      terms: ["immersive virtual reality", "virtual reality"],
-    },
-    {
-      id: uid(),
-      name: "Group 2",
-      terms: ["remote experiment", "remote participation", "remote study", "remote VR", "online study", "home\\w*", "participant[-\\s]?owned HMD", "participant[-\\s]?provided HMD", "self[-\\s]?administered", "unsupervised", "participant[-\\s]?led", "self[-\\s]?conducted", "web[-\\s]?based", "crowdsourc\\w*", "prolific", "amazon mechanical turk", "MTurk", "out[-\\s]?of[-\\s]?lab", "outside the lab", "decentralized"],
-      isRegex: true,
-    },
-    {
-      id: uid(),
-      name: "Group 3",
-      terms: ["user", "online", "study", "experiment", "behavior", "cognition", "evaluation", "empirical", "perception", "participant", "controlled", "task performance", "human[-\\s]?subject", "data collection"],
-      isRegex: true,
-    },
+    { id: uid(), name: "Virtual reality", terms: ["immersive virtual reality", "virtual reality"] },
+    { id: uid(), name: "Remote participation", terms: ["remote study", "online study", "home*", "crowdsourc*"] },
+    { id: uid(), name: "Excluded topic/type", terms: ["review", "survey"], exclude: true },
   ],
   operators: ["AND", "AND"],
 };
 
-function safeRegExp(pattern: string, flags: string) {
-  try {
-    return new RegExp(pattern, flags);
-  } catch {
-    const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(escaped, flags);
-  }
+function download(filename: string, content: BlobPart, mime = "text/plain") {
+  const url = URL.createObjectURL(new Blob([content], { type: `${mime};charset=utf-8` }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
-type FieldName = "title" | "abstract" | "keywords";
-
-function colorForBlockName(name: string, cfg: any) {
-  const block = cfg.blocks.find((b: any, i: number) => (b.name || `Block ${i + 1}`) === name);
-
-  // UX: Distinctive red style for exclusion blocks
-  if (block?.exclude) {
-    return { bg: "#FEF2F2", border: "#EF4444" };
-  }
-
-  const idx = Math.max(
-    0,
-    cfg.blocks.findIndex((b: any, i: number) => (b.name || `Block ${i + 1}`) === name)
-  );
-  const palette = [
-    { bg: "#F1F5FF", border: "#3B82F6" },
-    { bg: "#FDF2F8", border: "#EC4899" },
-    { bg: "#ECFDF5", border: "#10B981" },
-    { bg: "#FEF3C7", border: "#F59E0B" },
-    { bg: "#EDE9FE", border: "#8B5CF6" },
-  ];
-  return palette[idx % palette.length];
+function workflowSignature(bib: string, requiredFields: CanonicalMetadataField[], metadataAppliedSignature: string | null, config: QueryConfig, resolutions: Record<string, DuplicateResolution>) {
+  return sourceSignature(`${bib}\u0000${JSON.stringify({ requiredFields, metadataAppliedSignature, config, resolutions })}`);
 }
 
-function totalHits(fields: any) {
-  return (fields?.title?.length || 0) + (fields?.abstract?.length || 0) + (fields?.keywords?.length || 0);
+function metadataSignature(records: BibtexRecord[], requiredFields: CanonicalMetadataField[]) {
+  return sourceSignature(JSON.stringify({ records: records.map((record) => [record.internalId, record.fields]), requiredFields }));
 }
 
-function MatchBreakdown({ cfg, matchedMap, caption }: { cfg: any; matchedMap: any; caption?: string }) {
-  const entries = Object.entries(matchedMap || {})
-    .filter(([_, f]: any) => totalHits(f) > 0)
-    .sort((a: any, b: any) => totalHits(b[1]) - totalHits(a[1]));
+function statusFor(complete: boolean, ready: boolean, started: boolean, stale = false): WorkflowStatus {
+  if (stale) return "out_of_date";
+  if (complete) return "complete";
+  if (ready) return "ready";
+  return started ? "needs_attention" : "not_started";
+}
 
+const statusStyle: Record<WorkflowStatus, string> = {
+  not_started: "bg-slate-100 text-slate-600",
+  needs_attention: "bg-amber-100 text-amber-800",
+  ready: "bg-blue-100 text-blue-800",
+  complete: "bg-green-100 text-green-800",
+  out_of_date: "bg-amber-100 text-amber-800",
+};
+
+function StatusBadge({ status }: { status: WorkflowStatus }) {
+  return <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${statusStyle[status]}`}>{status.replaceAll("_", " ")}</span>;
+}
+
+function GateList({ items }: { items: Array<{ ok: boolean; label: string }> }) {
   return (
-    <div className="mt-2">
-      <div className="text-xs text-slate-500 mb-1">Where terms matched (by block &amp; field){caption ? ` — ${caption}` : ""}</div>
-
-      {entries.length === 0 ? (
-        <div className="text-xs text-slate-500">No term hits in selected fields.</div>
-      ) : (
-        <div className="flex flex-col gap-2">
-          {entries.map(([block, fields]: any) => {
-            const { bg, border } = colorForBlockName(block, cfg);
-            const pills = [
-              { key: "Title", list: fields.title || [] },
-              { key: "Abstract", list: fields.abstract || [] },
-              { key: "Keywords", list: fields.keywords || [] },
-            ].filter((p) => p.list.length > 0);
-
-            return (
-              <div key={block} className="flex flex-wrap items-center gap-2">
-                <span className="inline-flex items-center gap-2 rounded-full border px-2 py-0.5 text-xs" style={{ background: bg, borderColor: border }} title={block}>
-                  <span className="inline-block h-2 w-2 rounded-full" style={{ background: border }} />
-                  {block}
-                </span>
-
-                {pills.map((p) => (
-                  <span key={p.key} className="inline-flex items-center rounded-full border px-2 py-0.5 text-[11px]" style={{ borderColor: border }} title={p.list.join(" • ")}>
-                    {p.key} <span className="ml-1 tabular-nums">({p.list.length})</span>
-                  </span>
-                ))}
-              </div>
-            );
-          })}
-        </div>
-      )}
+    <div className="grid gap-2 rounded-xl border bg-slate-50 p-4">
+      <div className="font-medium">Readiness checklist</div>
+      {items.map((item) => <div key={item.label} className={`flex items-start gap-2 text-sm ${item.ok ? "text-green-700" : "text-amber-800"}`}>{item.ok ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" /> : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />}<span>{item.label}</span></div>)}
     </div>
   );
 }
 
-function escapeHTML(s: string) {
-  return (s || "").replace(
-    /[&<>"']/g,
-    (ch) =>
-      ((
-        {
-          "&": "&amp;",
-          "<": "&lt;",
-          ">": "&gt;",
-          '"': "&quot;",
-          "'": "&#39;",
-        } as const
-      )[ch]!)
+function RecordSummary({ record }: { record: BibtexRecord }) {
+  return (
+    <div className="grid gap-1">
+      <div className="font-medium">{record.fields.title || "Untitled record"}</div>
+      <div className="text-xs text-slate-500">{record.citekey} · {record.fields.author || "No author"} · {record.fields.year || "No year"} · line {record.line}</div>
+      <div className="flex flex-wrap gap-1 pt-1">
+        {["title", "abstract", "keywords", "doi", "author", "year"].map((field) => <span key={field} className={`rounded-full border px-2 py-0.5 text-[11px] ${record.fields[field] || (field === "abstract" && (record.fields.abs || record.fields.summary)) || (field === "keywords" && record.fields.keyword) ? "border-green-200 bg-green-50 text-green-700" : "border-slate-200 text-slate-400"}`}>{field}</span>)}
+      </div>
+    </div>
   );
 }
 
-function compileRegexForBlockField(blockCfg: { name?: string; isRegex?: boolean } | undefined, hits: string[] | undefined, caseInsensitive: boolean): RegExp | null {
-  if (!blockCfg || !hits?.length) return null;
-  const sortDesc = (a: string, b: string) => b.length - a.length;
-
-  const source = `(?:${[...hits]
-    .sort(sortDesc)
-    .map((h) => toSmartWordPattern(h, !!blockCfg.isRegex))
-    .join("|")})`;
-
-  const flags = `g${caseInsensitive ? "i" : ""}`;
-  return new RegExp(source, flags);
-}
-
-type Span = { start: number; end: number; block: string; text: string };
-
-function collectSpans(text: string, arr: Array<{ block: string; re: RegExp }>): Span[] {
-  const spans: Span[] = [];
-  for (const { block, re } of arr) {
-    const rx = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
-    let m: RegExpExecArray | null;
-    while ((m = rx.exec(text))) {
-      spans.push({
-        start: m.index,
-        end: m.index + m[0].length,
-        block,
-        text: m[0],
-      });
-      if (m[0].length === 0) rx.lastIndex++;
-    }
-  }
-
-  spans.sort((a, b) => a.start - b.start || b.end - b.start - (a.end - a.start));
-  const picked: Span[] = [];
-  let lastEnd = -1;
-  for (const s of spans) {
-    if (s.start >= lastEnd) {
-      picked.push(s);
-      lastEnd = s.end;
-    }
-  }
-  return picked;
-}
-
-function highlightByBlocks(text: string, matchedTermsMap: Record<string, Partial<Record<FieldName, string[]>>>, cfg: QueryConfig, field: FieldName) {
-  if (!text) return "";
-  const perBlock: Array<{ block: string; re: RegExp }> = [];
-
-  for (const [blockName, fields] of Object.entries(matchedTermsMap || {})) {
-    const blockCfg = cfg.blocks.find((b) => (b.name || "") === blockName);
-    const hits = (fields?.[field] || []) as string[];
-    const re = compileRegexForBlockField(blockCfg, hits, !!cfg.caseInsensitive);
-    if (re) perBlock.push({ block: blockName, re });
-  }
-
-  if (!perBlock.length) return escapeHTML(text);
-
-  const spans = collectSpans(text, perBlock);
-  if (!spans.length) return escapeHTML(text);
-
-  let out = "";
-  let pos = 0;
-  for (const s of spans) {
-    const { bg, border } = colorForBlockName(s.block, cfg);
-    out += escapeHTML(text.slice(pos, s.start));
-    out += `<mark class="hl" data-block="${escapeHTML(s.block)}" style="background:${bg};border:1px solid ${border};border-radius:0.25rem;padding:0 0.15em;">${escapeHTML(s.text)}</mark>`;
-    pos = s.end;
-  }
-  out += escapeHTML(text.slice(pos));
-  return out;
-}
-
-function parseBibtexEntries(text: string) {
-  const entries: any[] = [];
-  const src = text || "";
-  let i = 0;
-  const n = src.length;
-
-  const headerRe = /^@(\w+)\s*\{\s*/;
-  const fieldRe = /(\w+)\s*=\s*("(?:\\.|[^"\\])*"|\{(?:\\.|[^{}]|\{[^{}]*\})*\})\s*,?/gis;
-
-  while (i < n) {
-    const at = src.indexOf("@", i);
-    if (at === -1) break;
-
-    const head = src.slice(at);
-    const m = head.match(headerRe);
-    if (!m) {
-      i = at + 1;
-      continue;
-    }
-
-    const type = m[1];
-    let j = at + m[0].length;
-
-    let depth = 1;
-    let inQuote = false;
-    while (j < n) {
-      const ch = src[j];
-
-      if (ch === '"' && src[j - 1] !== "\\" && depth === 1) {
-        inQuote = !inQuote;
-        j++;
-        continue;
-      }
-
-      if (!inQuote) {
-        if (ch === "{") depth++;
-        else if (ch === "}") {
-          depth--;
-          if (depth === 0) {
-            j++;
-            break;
-          }
-        }
-      }
-      j++;
-    }
-
-    const chunk = src.slice(at, j).trim();
-
-    const citeKeyMatch = chunk.match(/^@\w+\s*\{\s*([^,]+)\s*,/s);
-    if (!citeKeyMatch) {
-      i = j;
-      continue;
-    }
-    const citekey = citeKeyMatch[1];
-
-    const fields: Record<string, string> = {};
-    let fm: RegExpExecArray | null;
-    while ((fm = fieldRe.exec(chunk))) {
-      const key = fm[1].toLowerCase();
-      const valRaw = fm[2].trim();
-      let val = valRaw;
-      if ((val.startsWith("{") && val.endsWith("}")) || (val.startsWith('"') && val.endsWith('"'))) {
-        val = val.slice(1, -1);
-      }
-      fields[key] = val;
-    }
-
-    entries.push({ entry_type: type, citekey, ...fields, __raw: chunk });
-    i = j;
-  }
-
-  if (entries.length === 0 && src.trim().length > 0) {
-    throw new Error("No BibTeX entries found. Did you forget the '@' symbol?");
-  }
-
-  return entries;
-}
-
-function buildBibEntry(entry: any) {
-  const { entry_type, citekey, __raw, ...fields } = entry;
-  const ordered = Object.entries(fields)
-    .filter(([k]) => !k.startsWith("__"))
-    .map(([k, v]) => `  ${k} = {${v}}`)
-    .join(",\n");
-  return `@${entry_type}{${citekey},\n${ordered}\n}`;
-}
-
-function csvEscape(s: string) {
-  if (s == null) return "";
-  const needs = /[",\n]/.test(s);
-  const t = String(s).replace(/"/g, '""');
-  return needs ? `"${t}"` : t;
-}
-
-function toCSV(rows: any[]) {
-  const headers = ["CiteKey", "Title", "Authors", "Year", "Venue", "URL/DOI", "Matched Blocks", "Matched Terms (by block & field)"];
-  const body = rows.map((r) => [r.CiteKey, r.Title, r.Authors, r.Year, r.Venue, r.URL, r.MatchedBlocks, r.MatchedTermsDetail].map(csvEscape).join(",")).join("\n");
-  return headers.join(",") + "\n" + body;
-}
-
-function download(filename: string, content: string, mime = "text/plain") {
-  const blob = new Blob([content], { type: mime + ";charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-function hasRegexMeta(s: string) {
-  return /[\\.^$|()[\]?+{}]/.test(s);
-}
-
-function escExceptStar(s: string) {
-  return s.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function toSmartWordPattern(term: string, isRegex: boolean) {
-  const t = term.trim();
-
-  if (isRegex && hasRegexMeta(t)) return t;
-
-  const trailingStar = /\*$/.test(t);
-  if (trailingStar) {
-    const stem = escExceptStar(t.slice(0, -1));
-    return `\\b${stem}[\\w-]*`;
-  }
-
-  return `\\b${escExceptStar(t)}\\b`;
-}
-
-function evaluateQueryOnText(_text: string, cfg: QueryConfig) {
-  const flags = cfg.caseInsensitive ? "i" : "";
-  const compiled = cfg.blocks
-    .map((b, idx) => {
-      const terms = (b.terms || []).filter((t) => t.trim().length > 0);
-      if (terms.length === 0) return null;
-      const regexes = terms.map((t) => safeRegExp(toSmartWordPattern(t, !!b.isRegex), flags));
-      return {
-        index: idx,
-        name: b.name || `Block ${idx + 1}`,
-        block: b,
-        terms,
-        regexes,
-      };
-    })
-    .filter(Boolean) as {
-    index: number;
-    name: string;
-    block: Block;
-    terms: string[];
-    regexes: RegExp[];
-  }[];
-
-  return function matchesByFields(fields: { title?: string; abstract?: string; keywords?: string }, selected: { title: boolean; abstract: boolean; keywords: boolean }) {
-    const texts: Record<"title" | "abstract" | "keywords", string> = {
-      title: selected.title ? fields.title || "" : "",
-      abstract: selected.abstract ? fields.abstract || "" : "",
-      keywords: selected.keywords ? fields.keywords || "" : "",
-    };
-
-    const matchedBlocks: string[] = [];
-    const detailed: Record<string, { title?: string[]; abstract?: string[]; keywords?: string[] }> = {};
-
-    const blockHitAtLeastOne = (cidx: number) => {
-      const c = compiled[cidx];
-      let any = false;
-      const perFieldHits: {
-        title?: string[];
-        abstract?: string[];
-        keywords?: string[];
-      } = {};
-      (Object.keys(texts) as Array<keyof typeof texts>).forEach((field) => {
-        const t = texts[field];
-        if (!t) return;
-        const hits: string[] = [];
-        c.regexes.forEach((re, i) => {
-          if (re.test(t)) hits.push(c.terms[i]);
-        });
-        if (hits.length > 0) {
-          (perFieldHits as any)[field] = hits;
-          any = true;
-        }
-      });
-
-      // UX Fix: Always record hits, even if it's an excluded block, so we can show WHY it was excluded.
-      if (any) detailed[compiled[cidx].name] = perFieldHits;
-
-      return any;
-    };
-
-    if (compiled.length === 0) return { ok: true, matchedBlocks, detailed };
-
-    const firstHit = blockHitAtLeastOne(0);
-    let val = compiled[0].block.exclude ? !firstHit : firstHit;
-    if (!compiled[0].block.exclude && firstHit) matchedBlocks.push(compiled[0].name);
-
-    for (let i = 0; i < cfg.operators.length && i + 1 < compiled.length; i++) {
-      const cidx = i + 1;
-      const hit = blockHitAtLeastOne(cidx);
-      const rhs = compiled[cidx].block.exclude ? !hit : hit;
-      const op = cfg.operators[i];
-      val = op === "AND" ? val && rhs : val || rhs;
-      if (!compiled[cidx].block.exclude && hit) matchedBlocks.push(compiled[cidx].name);
-    }
-
-    return { ok: val, matchedBlocks, detailed };
-  };
-}
-
-function parseBooleanQuery(input: string) {
-  if (!input) return null;
-  const s = input.replace(/\s+/g, " ").trim();
-
-  const groups: string[] = [];
-  let buf = "";
-  let depth = 0;
-  let inQuote = false;
-  let quoteChar = "";
-
-  const pushGroup = () => {
-    if (buf.trim().length) groups.push(buf.trim());
-    buf = "";
-  };
-
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-
-    if (!inQuote && (ch === '"' || ch === "'")) {
-      inQuote = true;
-      quoteChar = ch;
-      buf += ch;
-      continue;
-    }
-    if (inQuote) {
-      buf += ch;
-      if (ch === quoteChar) {
-        inQuote = false;
-        quoteChar = "";
-      }
-      continue;
-    }
-    if (ch === "(") {
-      depth++;
-      buf += ch;
-      continue;
-    }
-    if (ch === ")") {
-      depth = Math.max(0, depth - 1);
-      buf += ch;
-      continue;
-    }
-
-    if (depth === 0 && s.slice(i, i + 3).toUpperCase() === "AND") {
-      const prev = s[i - 1],
-        next = s[i + 3];
-      if ((prev === " " || prev === ")") && (next === " " || next === "(" || next === undefined)) {
-        pushGroup();
-        i += 2;
-        continue;
-      }
-    }
-    buf += ch;
-  }
-  pushGroup();
-
-  const blocks: Block[] = [];
-  const operators: Operator[] = [];
-
-  groups.forEach((group, gi) => {
-    let g = group.trim();
-
-    let exclude = false;
-    if (/^NOT\s+/i.test(g)) {
-      exclude = true;
-      g = g.replace(/^NOT\s+/i, "").trim();
-    }
-
-    if (g.startsWith("(") && g.endsWith(")")) g = g.slice(1, -1).trim();
-
-    const terms: string[] = [];
-    let tb = "";
-    depth = 0;
-    inQuote = false;
-    quoteChar = "";
-    const pushTerm = () => {
-      const t = tb.trim();
-      if (t) terms.push(t);
-      tb = "";
-    };
-
-    for (let i = 0; i < g.length; i++) {
-      const ch = g[i];
-
-      if (!inQuote && (ch === '"' || ch === "'")) {
-        inQuote = true;
-        quoteChar = ch;
-        tb += ch;
-        continue;
-      }
-      if (inQuote) {
-        tb += ch;
-        if (ch === quoteChar) {
-          inQuote = false;
-          quoteChar = "";
-        }
-        continue;
-      }
-      if (ch === "(") {
-        depth++;
-        tb += ch;
-        continue;
-      }
-      if (ch === ")") {
-        depth = Math.max(0, depth - 1);
-        tb += ch;
-        continue;
-      }
-
-      if (depth === 0 && g.slice(i, i + 2).toUpperCase() === "OR") {
-        const prev = g[i - 1],
-          next = g[i + 2];
-        if ((prev === " " || prev === ")") && (next === " " || next === "(" || next === undefined)) {
-          pushTerm();
-          i += 1;
-          continue;
-        }
-      }
-      tb += ch;
-    }
-    pushTerm();
-
-    const cleanTerms = terms.map((t) => t.replace(/^["']|["']$/g, "").trim()).filter(Boolean);
-
-    blocks.push({
-      id: uid(),
-      name: `Group ${gi + 1}`,
-      terms: cleanTerms,
-      isRegex: false,
-      exclude,
-    });
-
-    if (gi < groups.length - 1) operators.push("AND");
-  });
-
-  return { blocks, operators };
+function ParsedRecords({ snapshot, onJump, onFix }: { snapshot: ImportSnapshot; onJump: (diagnostic: BibtexDiagnostic | BibtexRecord) => void; onFix: (diagnostic: BibtexDiagnostic) => void }) {
+  const warningKeys = new Set(snapshot.parsed.diagnostics.filter((item) => item.severity === "warning").map((item) => item.citekey).filter(Boolean));
+  const attention = snapshot.parsed.records.filter((record) => warningKeys.has(record.citekey));
+  const valid = snapshot.parsed.records.filter((record) => !warningKeys.has(record.citekey));
+  const errors = snapshot.parsed.diagnostics.filter((item) => item.severity === "error");
+  return (
+    <div className="grid gap-3">
+      <details open={errors.length > 0} className="rounded-xl border bg-white p-3">
+        <summary className="cursor-pointer font-medium text-red-700">Blocking regions ({errors.length})</summary>
+        <div className="mt-3 grid gap-2">{errors.map((item, index) => <div key={`${item.code}-${index}`} className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm"><div className="font-medium">Lines {item.range.startLine}–{item.range.endLine}: {item.message}</div><div className="mt-1 text-red-700">{item.guidance}</div><div className="mt-2 flex flex-wrap gap-2"><Button size="sm" variant="outline" onClick={() => onJump(item)}>Jump to source</Button>{item.fix && <Button size="sm" onClick={() => onFix(item)}>{item.fix.label}</Button>}</div></div>)}</div>
+      </details>
+      <details open={attention.length > 0} className="rounded-xl border bg-white p-3">
+        <summary className="cursor-pointer font-medium text-amber-800">Needs attention ({attention.length})</summary>
+        <div className="mt-3 grid gap-2">{attention.map((record) => <button key={record.internalId} className="rounded-lg border p-3 text-left hover:bg-slate-50" onClick={() => onJump(record)}><RecordSummary record={record} /></button>)}</div>
+      </details>
+      <details className="rounded-xl border bg-white p-3">
+        <summary className="cursor-pointer font-medium text-green-800">Structurally valid ({valid.length})</summary>
+        <div className="mt-3 max-h-96 grid gap-2 overflow-y-auto">{valid.map((record) => <button key={record.internalId} className="rounded-lg border p-3 text-left hover:bg-slate-50" onClick={() => onJump(record)}><RecordSummary record={record} /></button>)}</div>
+      </details>
+    </div>
+  );
 }
 
 export default function App() {
-  const [bib, setBib] = useState<string>("");
-  const [cfg, setCfg] = useState<QueryConfig>(DEFAULT_CONFIG);
-  const [running, setRunning] = useState(false);
-  const [queryString, setQueryString] = useState<string>("");
-  const fileRef = useRef<HTMLInputElement>(null);
-  const [matchedBib, setMatchedBib] = useState<string>("");
+  const [step, setStep] = useState<Step>("import");
+  const [bib, setBib] = useState("");
+  const [sourceName, setSourceName] = useState("pasted-input.bib");
+  const [requiredMetadataFields, setRequiredMetadataFields] = useState<CanonicalMetadataField[]>(["title", "author"]);
+  const [metadataConfirmed, setMetadataConfirmed] = useState(false);
+  const [metadataAppliedSignature, setMetadataAppliedSignature] = useState<string | null>(null);
+  const [importSnapshot, setImportSnapshot] = useState<ImportSnapshot | null>(null);
+  const [jumpTo, setJumpTo] = useState<{ from: number; to: number; nonce: number } | null>(null);
+  const [config, setConfig] = useState<QueryConfig>(DEFAULT_CONFIG);
+  const [queryString, setQueryString] = useState("");
+  const [queryParseErrors, setQueryParseErrors] = useState<QueryParseError[]>([]);
+  const [resolutions, setResolutions] = useState<Record<string, DuplicateResolution>>({});
   const [runOutput, setRunOutput] = useState<RunOutput | null>(null);
+  const [running, setRunning] = useState(false);
+  const [generatingWorkbook, setGeneratingWorkbook] = useState(false);
+  const [workbookError, setWorkbookError] = useState("");
+  const [message, setMessage] = useState("");
+  const bibFileRef = useRef<HTMLInputElement>(null);
+  const projectFileRef = useRef<HTMLInputElement>(null);
 
-  const addBlockAt = (index: number) => {
-    const nb: Block = {
-      id: uid(),
-      name: `Block ${cfg.blocks.length + 1}`,
-      terms: [""],
-      isRegex: false,
-    };
-    const blocks = [...cfg.blocks.slice(0, index), nb, ...cfg.blocks.slice(index)];
-    const operators = [...cfg.operators];
-    if (index === 0) operators.unshift("AND");
-    else operators.splice(index, 0, "AND");
-    setCfg({ ...cfg, blocks, operators });
+  const effectiveSnapshot = importSnapshot;
+  const importGate = importReadiness(effectiveSnapshot, bib);
+  const duplicateGroups = useMemo(() => effectiveSnapshot && importGate.ready ? findDuplicateGroups(effectiveSnapshot.parsed.records) : [], [effectiveSnapshot, importGate.ready]);
+  const unresolvedGroups = duplicateGroups.filter((group) => !resolutions[group.id]);
+  const dedupReady = importGate.ready && unresolvedGroups.length === 0;
+  const dedupResult = useMemo(() => effectiveSnapshot ? applyDuplicateResolutions(effectiveSnapshot.parsed.records, duplicateGroups, resolutions) : { records: [], audit: [], decisionAudit: [] }, [effectiveSnapshot, duplicateGroups, resolutions]);
+  const currentMetadataSignature = metadataSignature(dedupResult.records, requiredMetadataFields);
+  const metadataPreview = useMemo(() => applyMetadataRequirements(dedupResult.records, requiredMetadataFields), [dedupResult.records, requiredMetadataFields]);
+  const dedupMetadataCounts = useMemo(() => calculateMetadataFieldCounts(dedupResult.records), [dedupResult.records]);
+  const metadataReady = dedupReady && metadataConfirmed && metadataAppliedSignature === currentMetadataSignature;
+  const queryValidation = validateQueryConfig(config);
+  const readyToScreen = metadataReady && queryValidation.length === 0;
+  const currentSignature = workflowSignature(bib, requiredMetadataFields, metadataAppliedSignature, config, resolutions);
+  const resultsStale = !!runOutput && runOutput.signature !== currentSignature;
+  const sourceStale = !!importSnapshot && importSnapshot.sourceSignature !== sourceSignature(bib);
+
+  const stepStatuses: Record<Step, WorkflowStatus> = {
+    import: statusFor(importGate.ready, importGate.ready, !!bib, sourceStale),
+    dedup: statusFor(dedupReady, dedupReady, duplicateGroups.length > 0, sourceStale),
+    metadata: statusFor(metadataReady, dedupReady, dedupReady, !!metadataAppliedSignature && metadataAppliedSignature !== currentMetadataSignature),
+    query: statusFor(!!runOutput && !resultsStale, readyToScreen, config.blocks.length > 0, sourceStale || !metadataReady || (!!runOutput && resultsStale)),
+    results: statusFor(!!runOutput && !resultsStale, !!runOutput, !!runOutput, resultsStale),
   };
 
-  const removeBlock = (id: string, idx: number) => {
-    const blocks = cfg.blocks.filter((b) => b.id !== id);
-    let operators = [...cfg.operators];
-    if (operators.length > 0) {
-      if (idx === 0) operators.shift();
-      else operators.splice(idx - 1, 1);
-    }
-    setCfg({ ...cfg, blocks, operators });
+  const updateSource = (value: string, name?: string) => {
+    setBib(value);
+    if (typeof name === "string") setSourceName(name);
+    setMetadataConfirmed(false);
+    setMetadataAppliedSignature(null);
+    setMessage(value === bib ? "" : "Source changed. Validate and parse it again before continuing.");
   };
 
-  const updateBlock = (index: number, patch: Partial<Block>) => {
-    const blocks = [...cfg.blocks];
+  const readBibFile = async (file: File) => {
+    if (!file.name.toLowerCase().endsWith(".bib")) { setMessage("Choose a .bib file."); return; }
+    updateSource(await file.text(), file.name);
+  };
+
+  const validateImport = () => {
+    const parsed = parseBibtex(bib);
+    setImportSnapshot(createImportSnapshot(bib, parsed));
+    setResolutions({});
+    setMetadataConfirmed(false);
+    setMetadataAppliedSignature(null);
+    setMessage(parsed.hasBlockingErrors ? "Parsing found blocking structural errors. Use the markers and grouped diagnostics to repair them." : `Parsed ${parsed.records.length} structurally valid records. Review the field counts before continuing.`);
+  };
+
+  const applySuggestedClosure = (diagnostic: BibtexDiagnostic) => {
+    if (!diagnostic.fix) return;
+    const fixedSource = applyBibtexDiagnosticFix(bib, diagnostic);
+    const parsed = parseBibtex(fixedSource);
+    setBib(fixedSource);
+    setImportSnapshot(createImportSnapshot(fixedSource, parsed));
+    setResolutions({});
+    setMetadataConfirmed(false);
+    setMetadataAppliedSignature(null);
+    setMessage(parsed.hasBlockingErrors ? `Inserted the suggested closure. ${parsed.diagnostics.filter((item) => item.severity === "error").length} blocking issue(s) remain.` : `Inserted the suggested closure and reparsed ${parsed.records.length} valid records.`);
+  };
+
+  const applyQueryString = () => {
+    const parsed = parseBlockQuery(queryString);
+    if (!parsed.ok) { setQueryParseErrors(parsed.errors); return; }
+    setQueryParseErrors([]);
+    const blocks: QueryBlock[] = parsed.blocks.map((block) => ({ ...block, id: uid() }));
+    setConfig((current) => ({ ...current, blocks, operators: Array.from({ length: Math.max(0, blocks.length - 1) }, () => "AND") }));
+  };
+
+  const updateBlock = (index: number, patch: Partial<QueryBlock>) => setConfig((current) => {
+    const blocks = [...current.blocks];
     blocks[index] = { ...blocks[index], ...patch };
-    setCfg({ ...cfg, blocks });
-  };
+    return { ...current, blocks };
+  });
 
-  const updateOperator = (index: number, op: Operator) => {
-    const operators = [...cfg.operators];
-    operators[index] = op;
-    setCfg({ ...cfg, operators });
-  };
-
-  function computeTermStats(rows: any[]) {
-    type Field = "title" | "abstract" | "keywords";
-
-    const overallDocCounts = new Map<string, number>();
-    const overallFieldCounts: Record<Field, Map<string, number>> = {
-      title: new Map(),
-      abstract: new Map(),
-      keywords: new Map(),
-    };
-
-    const perBlock: Record<string, Record<string, { docCount: number; fields: Record<Field, number> }>> = {};
-
-    for (const r of rows) {
-      const mtm = (r.MatchedTermsMap || {}) as Record<string, Partial<Record<Field, string[]>>>;
-
-      const seenOverall = new Set<string>();
-      const seenInBlock = new Map<string, Set<string>>();
-
-      for (const [blockName, fields] of Object.entries(mtm)) {
-        perBlock[blockName] ||= {};
-        if (!seenInBlock.has(blockName)) seenInBlock.set(blockName, new Set());
-
-        (["title", "abstract", "keywords"] as Field[]).forEach((f) => {
-          const terms = (fields?.[f] || []) as string[];
-          for (const term of terms) {
-            const blk = (perBlock[blockName][term] ||= {
-              docCount: 0,
-              fields: { title: 0, abstract: 0, keywords: 0 },
-            });
-            blk.fields[f]++;
-
-            const seenBlockSet = seenInBlock.get(blockName)!;
-            if (!seenBlockSet.has(term)) {
-              blk.docCount++;
-              seenBlockSet.add(term);
-            }
-
-            overallFieldCounts[f].set(term, (overallFieldCounts[f].get(term) || 0) + 1);
-
-            if (!seenOverall.has(term)) {
-              overallDocCounts.set(term, (overallDocCounts.get(term) || 0) + 1);
-              seenOverall.add(term);
-            }
-          }
-        });
-      }
-    }
-
-    cfg.blocks.forEach((b, idx) => {
-      const name = b.name || `Block ${idx + 1}`;
-      perBlock[name] ||= {};
-      (b.terms || []).forEach((raw) => {
-        const term = (raw || "").trim();
-        if (!term) return;
-        perBlock[name][term] ||= {
-          docCount: 0,
-          fields: { title: 0, abstract: 0, keywords: 0 },
-        };
-      });
-    });
-
-    const overallTop = [...overallDocCounts.entries()].sort((a, b) => b[1] - a[1]).map(([term, docCount]) => ({ term, docCount }));
-
-    const topByBlock = Object.fromEntries(
-      Object.entries(perBlock).map(([blockName, termMap]) => {
-        const list = Object.entries(termMap)
-          .map(([term, v]) => ({
-            term,
-            docCount: v.docCount,
-            fields: v.fields,
-          }))
-          .sort((a, b) => b.docCount - a.docCount);
-        return [blockName, list];
-      })
-    );
-
-    return {
-      totalMatchedStudies: rows.length,
-      overallTop,
-      topByBlock,
-      perBlock,
-      overallFieldCounts: Object.fromEntries((["title", "abstract", "keywords"] as Field[]).map((f) => [f, Object.fromEntries(overallFieldCounts[f])])),
-    };
-  }
-
-  const run = () => {
+  const runScreening = () => {
+    if (!readyToScreen) return;
     setRunning(true);
-    setRunOutput(null);
+    setMessage("");
     try {
-      const entries = parseBibtexEntries(bib);
-      const matcher = evaluateQueryOnText(bib, cfg);
-
-      let eligible = 0;
-      const matchedRows: any[] = [];
-      const partialRows: any[] = [];
-      const unmatchedRows: any[] = [];
-      const excludedRows: any[] = [];
-      const matchedBibEntries: string[] = [];
-
-      for (const e of entries) {
-        const title = (e.title || "").toString();
-        const abstract = (e.abstract || e.abs || e.summary || "").toString();
-        const keywords = (e.keywords || e.keyword || "").toString();
-
-        const hasAny = (cfg.searchFields.title && title) || (cfg.searchFields.abstract && abstract) || (cfg.searchFields.keywords && keywords);
-
-        const cleanTitle = title.replace(/\s+/g, " ").replace(/[{}]/g, "").trim();
-        const authors = (e.author || "").replace(/\s+/g, " ").trim();
-        const year = (e.year || "").trim();
-        const venue = (e.booktitle || e.journal || "").replace(/\s+/g, " ").trim();
-        const doi = (e.doi || "").trim();
-        const url = (e.url || (doi ? `https://doi.org/${doi}` : "")).trim();
-        const baseEntry = {
-          CiteKey: e.citekey,
-          Title: cleanTitle,
-          Authors: authors,
-          Year: year,
-          Venue: venue,
-          URL: url,
+      const matcher = createBlockMatcher(config);
+      const kept: ScreeningRow[] = [];
+      const excluded: ScreeningRow[] = [];
+      const keptRecords: BibtexRecord[] = [];
+      const termDocuments = new Map<string, Set<string>>();
+      metadataPreview.retainedRecords.forEach((record) => {
+        const title = record.fields.title || "";
+        const abstract = record.fields.abstract || record.fields.abs || record.fields.summary || "";
+        const keywords = record.fields.keywords || record.fields.keyword || "";
+        const hasSearchableData = Boolean((config.searchFields.title && title) || (config.searchFields.abstract && abstract) || (config.searchFields.keywords && keywords));
+        const blockResults = matcher({ title, abstract, keywords }, config.searchFields);
+        const decision = classifyBlockResults(blockResults, hasSearchableData);
+        const detail = blockResults.filter((result) => result.matched).map((result) => {
+          const fields = Object.entries(result.hits).filter(([, terms]) => terms?.length).map(([field, terms]) => `${field}: ${terms!.join(" | ")}`).join("; ");
+          result.configuredTerms.forEach((term) => {
+            if (Object.values(result.hits).some((values) => values?.includes(term))) termDocuments.set(term, new Set([...(termDocuments.get(term) || []), record.internalId]));
+          });
+          return `${result.blockName} [${fields}]`;
+        }).join("; ");
+        const base = {
+          RecordId: record.internalId,
+          CiteKey: record.citekey,
+          Title: title.replace(/[{}]/g, "").replace(/\s+/g, " ").trim(),
+          Authors: (record.fields.author || "").replace(/\s+/g, " ").trim(),
+          Year: record.fields.year || "",
+          Venue: record.fields.booktitle || record.fields.journal || "",
+          URL: record.fields.url || (record.fields.doi ? `https://doi.org/${record.fields.doi}` : ""),
+          TitleRaw: title,
+          AbstractRaw: abstract,
+          KeywordsRaw: keywords,
+          BlockResults: blockResults,
+          MatchedBlocks: blockResults.filter((result) => result.matched).map((result) => result.blockName).join("; "),
+          MatchedTermsDetail: detail,
         };
-
-        if (hasAny) eligible++;
-
-        const { ok, matchedBlocks, detailed } = matcher({ title, abstract, keywords }, cfg.searchFields);
-
-        const detailPieces: string[] = [];
-        Object.entries(detailed).forEach(([blockName, fields]) => {
-          const parts: string[] = [];
-          if (fields.title?.length) parts.push(`Title: ${fields.title.join(" | ")}`);
-          if (fields.abstract?.length) parts.push(`Abstract: ${fields.abstract.join(" | ")}`);
-          if (fields.keywords?.length) parts.push(`Keywords: ${fields.keywords.join(" | ")}`);
-          if (parts.length) detailPieces.push(`${blockName} [${parts.join("; ")}]`);
-        });
-
-        // Identify if a hit was found in an EXCLUDED block
-        const excludedBlockNames = cfg.blocks.filter((b) => b.exclude).map((b) => b.name || "");
-        const hitExcludedBlock = excludedBlockNames.some((name) => detailed[name]);
-
-        if (ok && hasAny) {
-          // 1. MATCHED
-          matchedRows.push({
-            ...baseEntry,
-            TitleRaw: title,
-            AbstractRaw: abstract,
-            KeywordsRaw: keywords,
-            MatchedBlocks: matchedBlocks.join("; "),
-            MatchedTermsDetail: detailPieces.join("; "),
-            MatchedTermsMap: detailed,
-          });
-          matchedBibEntries.push(buildBibEntry(e));
-        } else if (hasAny && hitExcludedBlock) {
-          // 2. EXCLUDED (Poison Pill hit)
-          excludedRows.push({
-            ...baseEntry,
-            TitleRaw: title,
-            AbstractRaw: abstract,
-            KeywordsRaw: keywords,
-            MatchedTermsMap: detailed,
-            MatchedTermsDetail: detailPieces.join("; "),
-            MatchedBlocks: Object.keys(detailed).join("; "), // These are the blocks that caused exclusion + other partial matches
-          });
-        } else if (hasAny && Object.keys(detailed).length > 0) {
-          // 3. PARTIAL (No exclusion hit, but some other blocks matched)
-          const allPosBlocks = cfg.blocks.filter((b) => !b.exclude).map((b, j) => b.name || `Block ${j + 1}`);
-          const hitBlocks = Object.keys(detailed);
-          const missingBlocks = allPosBlocks.filter((n) => !hitBlocks.includes(n));
-
-          partialRows.push({
-            ...baseEntry,
-            TitleRaw: title,
-            AbstractRaw: abstract,
-            KeywordsRaw: keywords,
-            MatchedTermsMap: detailed,
-            MatchedTermsDetail: detailPieces.join("; "),
-            PartialBlocks: hitBlocks.join("; "),
-            MissingBlocks: missingBlocks.join("; "),
-          });
-        } else if (hasAny) {
-          // 4. UNMATCHED
-          unmatchedRows.push({
-            ...baseEntry,
-            TitleRaw: title,
-            AbstractRaw: abstract,
-            KeywordsRaw: keywords,
-            MatchedTermsMap: detailed || {},
-          });
+        if (decision.kept) {
+          kept.push({ ...base, PrimaryExclusionReason: "", AllExclusionReasons: "", Evidence: "", ExclusionReasons: [] });
+          keptRecords.push(record);
+        } else {
+          excluded.push({ ...base, PrimaryExclusionReason: decision.primaryReason, AllExclusionReasons: decision.reasons.map((reason) => reason.message).join(" | "), Evidence: decision.reasons.map((reason) => `${reason.message} [${reason.evidence}]`).join(" | "), ExclusionReasons: decision.reasons });
         }
-      }
-
-      const report = {
-        total: entries.length,
-        eligible,
-        matched: matchedRows.length,
-        excluded: excludedRows.length,
-        partial: partialRows.length,
-        unmatched: unmatchedRows.length,
-      };
-
-      const stats = computeTermStats(matchedRows);
-
-      setRunOutput({
-        matched: matchedRows,
-        excluded: excludedRows,
-        partial: partialRows,
-        unmatched: unmatchedRows,
-        report,
-        termStats: stats,
       });
+      const runAt = new Date().toISOString();
+      setRunOutput({
+        entryHeaders: effectiveSnapshot?.parsed.discoveredHeaders || 0,
+        structurallyValid: effectiveSnapshot?.parsed.records.length || 0,
+        sourceName,
+        runAt,
+        validatedRecords: effectiveSnapshot?.parsed.records || [],
+        diagnostics: effectiveSnapshot?.parsed.diagnostics || [],
+        duplicateGroups,
+        duplicateDecisions: dedupResult.decisionAudit,
+        afterDeduplication: dedupResult.records,
+        metadataRequiredFields: [...requiredMetadataFields],
+        afterMetadata: metadataPreview.retainedRecords,
+        queryExpression: generateBooleanQuery(config),
+        queryBlocks: config.blocks.map((block) => ({ ...block, terms: [...block.terms] })),
+        searchFields: { ...config.searchFields },
+        caseInsensitive: config.caseInsensitive,
+        kept,
+        excluded,
+        screenedRecords: metadataPreview.retainedRecords,
+        keptRecords,
+        duplicateAudit: dedupResult.audit,
+        metadataRemovals: metadataPreview.removals,
+        blocks: config.blocks.map((block, index) => ({ id: block.id, name: block.name.trim() || `Block ${index + 1}`, exclude: !!block.exclude })),
+        signature: currentSignature,
+        termCounts: [...termDocuments].map(([term, ids]) => ({ term, count: ids.size })).sort((a, b) => b.count - a.count),
+      });
+      setWorkbookError("");
+      setStep("results");
+    } catch (error) {
+      setMessage(`Screening could not run: ${error instanceof Error ? error.message : "Unknown error"}`);
+      setStep("query");
+    } finally { setRunning(false); }
+  };
 
-      setMatchedBib(matchedBibEntries.join("\n\n"));
-    } catch (error: any) {
-      alert(`Error processing BibTeX: ${error.message}`);
-      setRunOutput(null);
+  const exportProject = () => download("literature_search_project.json", JSON.stringify(createProjectFile({ sourceName, bibtex: bib, metadataRequirements: { requiredFields: requiredMetadataFields, confirmed: metadataReady }, queryString, queryConfig: config, duplicateResolutions: resolutions }), null, 2), "application/json");
+
+  const exportWorkbook = async () => {
+    if (!runOutput || resultsStale || generatingWorkbook) return;
+    setGeneratingWorkbook(true);
+    setWorkbookError("");
+    try {
+      const buffer = await buildPrismaWorkbook(runOutput);
+      download(prismaWorkbookFilename(runOutput.sourceName, runOutput.runAt), buffer, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    } catch (error) {
+      setWorkbookError(`Workbook could not be generated: ${error instanceof Error ? error.message : "Unknown error"}`);
     } finally {
-      setRunning(false);
+      setGeneratingWorkbook(false);
     }
   };
 
-  const loadSample = () => {
-    const sample = `@article{sample1,
-  title={A remote study of immersive virtual reality task performance},
-  author={Doe, Jane},
-  year={2024},
-  journal={Imaginary Journal},
-  abstract={We conducted an online study using immersive virtual reality with participant-owned HMDs to evaluate behavior and task performance.}
-}
-
-@inproceedings{sample2,
-  title={On-site VR art},
-  author={Roe, John},
-  year={2023},
-  booktitle={Nice Conf},
-  abstract={An on-site installation without user study.}
-}
-
-@article{sample3,
-  title={Remote work is great},
-  author={Smith, Bob},
-  year={2022},
-  journal={WFH Today},
-  abstract={We look at remote participation in corporate settings. No VR involved.}
-}`;
-    setBib(sample);
+  const loadProjectOrConfig = async (file: File) => {
+    try {
+      const value = JSON.parse(await file.text());
+      const projectResult = parseProjectFile(value);
+      if (projectResult.ok) {
+        const project: ProjectFileV2 = projectResult.project;
+        const parsed = parseBibtex(project.bibtex);
+        const loadedConfig = normalizeQueryConfig(project.queryConfig, DEFAULT_CONFIG);
+        const loadedGroups = findDuplicateGroups(parsed.records);
+        const loadedDedup = applyDuplicateResolutions(parsed.records, loadedGroups, project.duplicateResolutions);
+        const loadedMetadataSignature = metadataSignature(loadedDedup.records, project.metadataRequirements.requiredFields);
+        setBib(project.bibtex); setSourceName(project.sourceName);
+        setImportSnapshot(createImportSnapshot(project.bibtex, parsed));
+        setRequiredMetadataFields(project.metadataRequirements.requiredFields);
+        setMetadataConfirmed(project.metadataRequirements.confirmed);
+        setMetadataAppliedSignature(project.metadataRequirements.confirmed ? loadedMetadataSignature : null);
+        setConfig(loadedConfig); setQueryString(project.queryString); setResolutions(project.duplicateResolutions); setRunOutput(null); setStep("import");
+        setMessage(projectResult.migrationNotice || "Project loaded and source reparsed. Review readiness before continuing.");
+      } else if (Array.isArray(value?.blocks)) {
+        setConfig(normalizeQueryConfig(value, DEFAULT_CONFIG)); setStep(dedupReady ? "query" : "import"); setMessage("Legacy query configuration loaded and normalized to required AND blocks.");
+      } else setMessage(projectResult.error);
+    } catch { setMessage("The selected JSON file could not be read. Current work was not changed."); }
   };
 
-  const saveConfig = () => {
-    const json = JSON.stringify(cfg, null, 2);
-    download("query_config.json", json, "application/json");
+  const navigate = (next: Step) => {
+    const allowed = next === "import" || (next === "dedup" && importGate.ready) || (next === "metadata" && dedupReady) || (next === "query" && metadataReady) || (next === "results" && !!runOutput);
+    if (allowed) setStep(next);
   };
 
-  const loadConfig = (file: File) => {
-    file.text().then((t) => {
-      try {
-        const obj = JSON.parse(t);
-        if (obj.blocks && obj.operators) setCfg(obj);
-      } catch {}
-    });
-  };
-
-  const exportCSV = () => {
-    if (!runOutput || runOutput.matched.length === 0) return;
-    download("matches.csv", toCSV(runOutput.matched), "text/csv");
-  };
-
-  const exportBib = () => {
-    download("matches.bib", matchedBib, "text/plain");
-  };
-
-  const applyPastedQuery = () => {
-    const parsed = parseBooleanQuery(queryString);
-    if (parsed) setCfg({ ...cfg, blocks: parsed.blocks, operators: parsed.operators });
-  };
+  const importChecklist = [
+    { ok: !!effectiveSnapshot && !sourceStale, label: "BibTeX source has a current parsed snapshot." },
+    { ok: !!effectiveSnapshot && !effectiveSnapshot.parsed.hasBlockingErrors, label: "No blocking structural errors remain." },
+  ];
+  const queryChecklist = [
+    { ok: importGate.ready, label: "Import validation is complete and current." },
+    { ok: dedupReady, label: unresolvedGroups.length ? `${unresolvedGroups.length} duplicate candidate group(s) still need a decision.` : "Every duplicate candidate group has a decision." },
+    { ok: metadataReady, label: metadataReady ? "Required metadata cleanup is applied and current." : "Apply the required metadata rules." },
+    { ok: queryValidation.length === 0, label: queryValidation.length ? queryValidation.join(" ") : "Query blocks and regular expressions are valid." },
+  ];
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-white to-slate-50 p-6">
-      <div className="mx-auto max-w-6xl grid gap-6">
-        <header className="flex items-center justify-between">
-          <h1 className="text-3xl font-semibold tracking-tight">Literature Search Builder</h1>
-          <div className="flex gap-2">
-            <Button variant="secondary" onClick={saveConfig} title="Save query config">
-              <Save className="h-4 w-4 mr-2" />
-              Save Config
-            </Button>
-            <Button variant="secondary" onClick={() => fileRef.current?.click()} title="Load query config">
-              <Upload className="h-4 w-4 mr-2" />
-              Load Config
-            </Button>
-            <input
-              ref={fileRef}
-              type="file"
-              accept="application/json"
-              className="hidden"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) loadConfig(f);
-                e.currentTarget.value = "";
-              }}
-            />
-          </div>
+    <div className="min-h-screen bg-gradient-to-b from-white to-slate-50 p-4 md:p-6">
+      <div className="mx-auto grid max-w-7xl gap-5">
+        <header className="flex flex-wrap items-center justify-between gap-3">
+          <div><h1 className="text-3xl font-semibold tracking-tight">Literature Screening Workflow</h1><p className="mt-1 text-sm text-slate-600">Validate, deduplicate, screen, and audit before full-text assessment.</p></div>
+          <div className="flex gap-2"><Button variant="outline" onClick={exportProject}><Save className="mr-2 h-4 w-4" />Export project</Button><Button variant="outline" onClick={() => projectFileRef.current?.click()}><FolderOpen className="mr-2 h-4 w-4" />Load project/config</Button><input ref={projectFileRef} type="file" accept="application/json,.json" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadProjectOrConfig(file); event.currentTarget.value = ""; }} /></div>
         </header>
 
-        <Tabs defaultValue="data">
-          <TabsList className="grid grid-cols-3 w-full">
-            <TabsTrigger value="data">1. Paste BibTeX</TabsTrigger>
-            <TabsTrigger value="query">2. Build Query</TabsTrigger>
-            <TabsTrigger value="run">3. Run & Report</TabsTrigger>
+        {message && <div className={`rounded-xl border p-3 text-sm ${message.includes("could not") || message.includes("blocking") ? "border-red-200 bg-red-50 text-red-800" : "border-blue-200 bg-blue-50 text-blue-800"}`}>{message}</div>}
+
+        <Tabs value={step} onValueChange={(value) => navigate(value as Step)}>
+          <TabsList className="grid h-auto w-full grid-cols-2 gap-1 p-1 lg:grid-cols-5">
+            {(["import", "dedup", "metadata", "query", "results"] as Step[]).map((item, index) => {
+              const disabled = item === "dedup" ? !importGate.ready : item === "metadata" ? !dedupReady : item === "query" ? !metadataReady : item === "results" ? !runOutput : false;
+              const labels = ["Import & Validate", "Deduplicate", "Required Metadata", "Define Query & Screen", "Results"];
+              return <TabsTrigger key={item} value={item} disabled={disabled} className="h-auto min-h-14 flex-wrap py-2"><span>{index + 1}. {labels[index]}</span><StatusBadge status={stepStatuses[item]} /></TabsTrigger>;
+            })}
           </TabsList>
 
-          <TabsContent value="data">
-            <Card className="shadow-sm">
-              <CardContent className="p-6 grid gap-4">
-                <div className="flex items-center justify-between">
-                  <Label className="text-base">BibTeX input</Label>
-                  <div className="flex gap-2">
-                    <Button variant="outline" onClick={loadSample}>
-                      <FileText className="h-4 w-4 mr-2" />
-                      Load Sample
-                    </Button>
-                    <Button variant="outline" onClick={() => setBib("")}>
-                      <Trash2 className="h-4 w-4 mr-2" />
-                      Clear
-                    </Button>
-                  </div>
-                </div>
-                <Textarea value={bib} onChange={(e) => setBib(e.target.value)} placeholder="Paste your .bib content here" className="min-h-[280px] font-mono text-sm" />
-                <p className="text-sm text-slate-500">Tip: you can paste the BibTeX you exported (e.g., from IEEE/ACM). Abstracts are required for matching.</p>
-              </CardContent>
-            </Card>
+          <TabsContent value="import">
+            <Card><CardContent className="grid gap-5 p-5 md:p-6">
+              <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-xl font-semibold">Import and validate BibTeX</h2><p className="text-sm text-slate-600">Create a stable parsed snapshot before configuring screening.</p></div><div className="flex gap-2"><Button variant="outline" onClick={() => bibFileRef.current?.click()}><Upload className="mr-2 h-4 w-4" />Upload .bib</Button><input ref={bibFileRef} type="file" accept=".bib,text/plain" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void readBibFile(file); event.currentTarget.value = ""; }} /><Button onClick={validateImport}><FileText className="mr-2 h-4 w-4" />Validate & parse records</Button></div></div>
+              <div onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); const file = event.dataTransfer.files[0]; if (file) void readBibFile(file); }} className="grid gap-2"><div className="flex justify-between text-xs text-slate-500"><span>{sourceName}</span><span>Paste, edit, upload, or drop a .bib file</span></div><BibtexSourceEditor value={bib} diagnostics={sourceStale ? [] : effectiveSnapshot?.parsed.diagnostics || []} jumpTo={jumpTo} onChange={updateSource} /></div>
+              {sourceStale && <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">Parsed records are out of date. Validate and parse the edited source again.</div>}
+              {effectiveSnapshot && !sourceStale && <>
+                <div><h3 className="mb-2 font-medium">Metadata present and missing</h3><div className="grid grid-cols-2 gap-3 md:grid-cols-4 lg:grid-cols-7">{CANONICAL_METADATA_FIELDS.map((field) => { const counts = effectiveSnapshot.fieldCounts[field]; return <div key={field} className="rounded-xl border bg-white p-3"><div className="text-xs text-slate-500">{METADATA_FIELD_LABELS[field]}</div><div className="mt-1 text-sm font-medium text-green-700">{counts.present} present</div><div className="text-sm font-medium text-amber-700">{counts.missing} missing</div></div>; })}</div></div>
+                <ParsedRecords snapshot={effectiveSnapshot} onJump={(item) => setJumpTo({ from: item.range.from, to: item.range.to, nonce: Date.now() })} onFix={applySuggestedClosure} />
+              </>}
+              <GateList items={importChecklist} />
+              <div className="flex justify-end"><Button disabled={!importGate.ready} onClick={() => setStep("dedup")}>Continue to deduplication<ChevronRight className="ml-2 h-4 w-4" /></Button></div>
+            </CardContent></Card>
+          </TabsContent>
+
+          <TabsContent value="dedup">
+            <Card><CardContent className="grid gap-5 p-5 md:p-6">
+              <div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="text-xl font-semibold">Resolve duplicate candidates</h2><p className="text-sm text-slate-600">Candidates use exact normalized DOI or title evidence. Cite keys are never matching evidence.</p></div><Button variant="outline" disabled={!unresolvedGroups.length} onClick={() => setResolutions((current) => { const next = { ...current }; unresolvedGroups.forEach((group) => { next[group.id] = { action: "merge", canonicalId: group.recordIds[0], enrichFromIds: group.recordIds.slice(1) }; }); return next; })}><Check className="mr-2 h-4 w-4" />Choose first for all unresolved</Button></div>
+              <div className="grid grid-cols-3 gap-3"><div className="rounded-xl border p-3"><div className="text-xs text-slate-500">Candidate groups</div><div className="text-2xl font-semibold">{duplicateGroups.length}</div></div><div className="rounded-xl border p-3"><div className="text-xs text-slate-500">Unresolved</div><div className="text-2xl font-semibold text-amber-700">{unresolvedGroups.length}</div></div><div className="rounded-xl border p-3"><div className="text-xs text-slate-500">Records removed</div><div className="text-2xl font-semibold">{dedupResult.audit.length}</div></div></div>
+              {!duplicateGroups.length && <div className="rounded-xl border border-green-200 bg-green-50 p-4 text-green-800">No DOI- or title-based duplicate candidates were found. This step is complete.</div>}
+              <div className="grid gap-4">{duplicateGroups.map((group) => {
+                const records = group.recordIds.map((id) => effectiveSnapshot!.parsed.records.find((record) => record.internalId === id)!).filter(Boolean);
+                const resolution = resolutions[group.id];
+                return <div key={group.id} className={`rounded-xl border p-4 ${resolution ? "border-green-200 bg-green-50/40" : "border-amber-300 bg-amber-50/40"}`}><div className="flex flex-wrap items-start justify-between gap-2"><div><div className="font-medium">{group.id}</div><div className="text-xs text-slate-500">{[...new Set(group.evidence.map((item) => `${item.kind.toUpperCase()}: ${item.value}`))].join(" · ")}</div></div><Button variant="outline" onClick={() => setResolutions((current) => ({ ...current, [group.id]: { action: "keep_all" } }))}>Keep all as distinct</Button></div><div className="mt-3 grid gap-2">{records.map((record) => { const canonical = resolution?.action === "merge" && resolution.canonicalId === record.internalId; return <div key={record.internalId} className={`rounded-lg border bg-white p-3 ${canonical ? "border-green-500 ring-1 ring-green-300" : ""}`}><RecordSummary record={record} /><div className="mt-2 flex flex-wrap items-center gap-3"><Button size="sm" variant={canonical ? "secondary" : "outline"} onClick={() => setResolutions((current) => ({ ...current, [group.id]: { action: "merge", canonicalId: record.internalId, enrichFromIds: records.filter((item) => item.internalId !== record.internalId).map((item) => item.internalId) } }))}>{canonical ? "Canonical record" : "Choose as canonical"}</Button>{resolution?.action === "merge" && !canonical && <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={resolution.enrichFromIds.includes(record.internalId)} onChange={(event) => setResolutions((current) => ({ ...current, [group.id]: { ...resolution, enrichFromIds: event.target.checked ? [...resolution.enrichFromIds, record.internalId] : resolution.enrichFromIds.filter((id) => id !== record.internalId) } }))} />Fill missing canonical fields from this record</label>}</div></div>; })}</div><div className="mt-2 text-xs font-medium">Decision: {resolution?.action === "keep_all" ? "Keep all as distinct" : resolution?.action === "merge" ? `Merge into ${records.find((record) => record.internalId === resolution.canonicalId)?.citekey}` : "Required"}</div></div>;
+              })}</div>
+              <GateList items={[{ ok: importGate.ready, label: "Import snapshot is valid and current." }, { ok: unresolvedGroups.length === 0, label: unresolvedGroups.length ? `${unresolvedGroups.length} candidate group(s) require a decision.` : "Every candidate group has an explicit decision." }]} />
+              <div className="flex justify-between"><Button variant="outline" onClick={() => setStep("import")}>Back</Button><Button disabled={!dedupReady} onClick={() => setStep("metadata")}>Continue to required metadata<ChevronRight className="ml-2 h-4 w-4" /></Button></div>
+            </CardContent></Card>
+          </TabsContent>
+
+          <TabsContent value="metadata">
+            <Card><CardContent className="grid gap-5 p-5 md:p-6">
+              <div><h2 className="text-xl font-semibold">Required metadata</h2><p className="text-sm text-slate-600">Choose the fields every deduplicated record must contain before query screening. All selected rules are required.</p></div>
+              <div className="grid gap-3 rounded-xl border bg-white p-4">
+                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{CANONICAL_METADATA_FIELDS.map((field) => <div key={field} className="flex items-center justify-between rounded-lg border p-3"><div><Label>{METADATA_FIELD_LABELS[field]}</Label><div className="text-xs text-slate-500">{dedupMetadataCounts[field].present} present · {dedupMetadataCounts[field].missing} missing</div></div><Switch checked={requiredMetadataFields.includes(field)} onCheckedChange={(checked) => { setRequiredMetadataFields((current) => checked ? CANONICAL_METADATA_FIELDS.filter((item) => item === field || current.includes(item)) : current.filter((item) => item !== field)); setMetadataConfirmed(false); }} /></div>)}</div>
+                <div className="text-xs text-slate-500">No fields selected means metadata cleanup is disabled after you explicitly apply the configuration.</div>
+              </div>
+              <div className="grid grid-cols-3 gap-3"><div className="rounded-xl border p-3"><div className="text-xs text-slate-500">After deduplication</div><div className="text-2xl font-semibold">{dedupResult.records.length}</div></div><div className="rounded-xl border border-red-200 p-3"><div className="text-xs text-slate-500">Will be removed</div><div className="text-2xl font-semibold text-red-700">{metadataPreview.removals.length}</div></div><div className="rounded-xl border border-green-200 p-3"><div className="text-xs text-slate-500">Will be screened</div><div className="text-2xl font-semibold text-green-700">{metadataPreview.retainedRecords.length}</div></div></div>
+              <div className="grid gap-3">{groupMetadataRemovals(metadataPreview.removals).map((group) => <details key={group.key} className="rounded-xl border border-red-200 bg-red-50/40 p-3"><summary className="cursor-pointer font-medium text-red-800">Missing {group.missingFields.map((field) => METADATA_FIELD_LABELS[field]).join(" + ")} ({group.rows.length})</summary><div className="mt-3 grid gap-2">{group.rows.map(({ record, missingFields }) => <div key={record.internalId} className="rounded-lg border bg-white p-3"><RecordSummary record={record} /><div className="mt-2 flex flex-wrap items-center gap-2">{missingFields.map((field) => <span key={field} className="rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-700">Missing {METADATA_FIELD_LABELS[field]}</span>)}<Button size="sm" variant="outline" className="ml-auto" onClick={() => { setJumpTo({ from: record.range.from, to: record.range.to, nonce: Date.now() }); setStep("import"); }}>Jump to source</Button></div></div>)}</div></details>)}{!metadataPreview.removals.length && <div className="rounded-xl border border-green-200 bg-green-50 p-4 text-green-800">Every deduplicated record satisfies the current metadata requirements.</div>}</div>
+              {metadataConfirmed && !metadataReady && <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">The deduplicated records or required fields changed. Apply the metadata requirements again.</div>}
+              <GateList items={[{ ok: dedupReady, label: "Duplicate resolution is complete and current." }, { ok: metadataReady, label: metadataReady ? "Metadata requirements are applied and current." : "Apply the current metadata requirements." }]} />
+              <div className="flex flex-wrap justify-between gap-2"><Button variant="outline" onClick={() => setStep("dedup")}>Back</Button><div className="flex gap-2"><Button onClick={() => { setMetadataConfirmed(true); setMetadataAppliedSignature(currentMetadataSignature); setMessage(`Applied metadata requirements: ${metadataPreview.removals.length} record(s) removed before screening.`); }}><Check className="mr-2 h-4 w-4" />Apply metadata requirements</Button><Button disabled={!metadataReady} onClick={() => setStep("query")}>Continue to query<ChevronRight className="ml-2 h-4 w-4" /></Button></div></div>
+            </CardContent></Card>
           </TabsContent>
 
           <TabsContent value="query">
-            <Card className="shadow-sm">
-              <CardContent className="p-6 grid gap-6">
-                <div className="grid gap-3">
-                  <div className="flex items-center justify-between">
-                    <Label className="text-base">Paste Boolean Query</Label>
-                    <div className="flex gap-2">
-                      <Button variant="outline" onClick={() => setQueryString("")}>
-                        <Trash2 className="h-4 w-4 mr-2" />
-                        Clear
-                      </Button>
-                      <Button onClick={applyPastedQuery}>
-                        <Filter className="h-4 w-4 mr-2" />
-                        Parse to Blocks
-                      </Button>
-                    </div>
-                  </div>
-                  <Textarea value={queryString} onChange={(e) => setQueryString(e.target.value)} placeholder={`("virtual reality" OR "immersive virtual reality") AND ("remote study" OR "online study") AND NOT ("survey" OR "review")`} className="min-h-[120px] font-mono text-sm" />
-                </div>
-
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-4">
-                    <Label className="text-base">Query Blocks</Label>
-                    <div className="flex items-center gap-2 text-sm text-slate-600">
-                      <Wrench className="h-4 w-4" />
-                      <span>Case-insensitive</span>
-                      <Switch checked={cfg.caseInsensitive} onCheckedChange={(v) => setCfg({ ...cfg, caseInsensitive: v })} />
-
-                      <span className="ml-4">Fields:</span>
-                      <div className="flex items-center gap-2">
-                        <span className="text-slate-600">Title</span>
-                        <Switch
-                          checked={cfg.searchFields.title}
-                          onCheckedChange={(v) =>
-                            setCfg({
-                              ...cfg,
-                              searchFields: { ...cfg.searchFields, title: v },
-                            })
-                          }
-                        />
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-slate-600">Abstract</span>
-                        <Switch
-                          checked={cfg.searchFields.abstract}
-                          onCheckedChange={(v) =>
-                            setCfg({
-                              ...cfg,
-                              searchFields: {
-                                ...cfg.searchFields,
-                                abstract: v,
-                              },
-                            })
-                          }
-                        />
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-slate-600">Keywords</span>
-                        <Switch
-                          checked={cfg.searchFields.keywords}
-                          onCheckedChange={(v) =>
-                            setCfg({
-                              ...cfg,
-                              searchFields: {
-                                ...cfg.searchFields,
-                                keywords: v,
-                              },
-                            })
-                          }
-                        />
-                      </div>
-                    </div>
-                  </div>
-                  <Button onClick={() => addBlockAt(cfg.blocks.length)}>
-                    <Plus className="h-4 w-4 mr-2" />
-                    Add Block
-                  </Button>
-                </div>
-
-                <div className="grid gap-4">
-                  {cfg.blocks.map((b, i) => (
-                    <div key={b.id} className={`rounded-2xl border shadow-sm p-4 ${b.exclude ? "bg-red-50 border-red-200" : "bg-white"}`}>
-                      <div className="flex flex-wrap items-center gap-3 justify-between">
-                        <div className="flex items-center gap-3">
-                          <Input value={b.name} onChange={(e) => updateBlock(i, { name: e.target.value })} className="w-56" />
-                          <div className="flex items-center gap-2 text-sm text-slate-600">
-                            <span>Regex</span>
-                            <Switch checked={!!b.isRegex} onCheckedChange={(v) => updateBlock(i, { isRegex: v })} />
-                          </div>
-                          <div className="flex items-center gap-2 text-sm text-slate-600">
-                            <span>Exclude (NOT)</span>
-                            <Switch checked={!!b.exclude} onCheckedChange={(v) => updateBlock(i, { exclude: v })} />
-                          </div>
-                        </div>
-                        <div className="flex gap-2">
-                          <Button variant="destructive" onClick={() => removeBlock(b.id, i)}>
-                            <Trash2 className="h-4 w-4 mr-2" />
-                            Remove
-                          </Button>
-                          <Button variant="outline" onClick={() => addBlockAt(i)}>
-                            <Plus className="h-4 w-4 mr-2" />
-                            Insert Above
-                          </Button>
-                          <Button variant="outline" onClick={() => addBlockAt(i + 1)}>
-                            <Plus className="h-4 w-4 mr-2" />
-                            Insert Below
-                          </Button>
-                        </div>
-                      </div>
-                      <div className="mt-3 grid gap-2">
-                        {b.terms.map((t, ti) => (
-                          <div key={ti} className="flex items-center gap-2">
-                            <Input
-                              value={t}
-                              onChange={(e) => {
-                                const terms = [...b.terms];
-                                terms[ti] = e.target.value;
-                                updateBlock(i, { terms });
-                              }}
-                              placeholder={b.isRegex ? "regex term" : "literal term"}
-                            />
-                            <Button
-                              variant="ghost"
-                              onClick={() => {
-                                const terms = b.terms.filter((_, k) => k !== ti);
-                                updateBlock(i, { terms });
-                              }}
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
-                          </div>
-                        ))}
-                        <Button variant="secondary" onClick={() => updateBlock(i, { terms: [...b.terms, ""] })}>
-                          <Plus className="h-4 w-4 mr-2" />
-                          Add term
-                        </Button>
-                      </div>
-
-                      {i < cfg.blocks.length - 1 && (
-                        <div className="mt-4 flex items-center justify-center gap-3">
-                          <Select value={cfg.operators[i]} onValueChange={(v: Operator) => updateOperator(i, v as Operator)}>
-                            <SelectTrigger className="w-40">
-                              <SelectValue placeholder={cfg.operators[i]} />
-                            </SelectTrigger>
-                            <SelectContent>
-                              <SelectItem value="AND">AND</SelectItem>
-                              <SelectItem value="OR">OR</SelectItem>
-                            </SelectContent>
-                          </Select>
-                          <span className="text-sm text-slate-500">(operator to next block)</span>
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </CardContent>
-            </Card>
+            <Card><CardContent className="grid gap-5 p-5 md:p-6">
+              <div><h2 className="text-xl font-semibold">Define query and screen</h2><p className="text-sm text-slate-600">The Boolean text imports blocks. Once applied, the editable blocks are authoritative.</p></div>
+              <div className="grid gap-2"><div className="flex justify-between"><Label>Boolean query import draft</Label><Button onClick={applyQueryString}><Filter className="mr-2 h-4 w-4" />Parse query to blocks</Button></div><Textarea value={queryString} onChange={(event) => { setQueryString(event.target.value); setQueryParseErrors([]); }} className="min-h-28 font-mono" placeholder={'("virtual reality" OR immersive) AND NOT (review OR survey)'} />{queryParseErrors.length > 0 && <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">{queryParseErrors.map((error, index) => <div key={`${error.position}-${index}`}>Position {error.position + 1}: {error.message}</div>)}</div>}</div>
+              <div className="grid gap-2"><Label>Current generated expression</Label><div className="rounded-xl border bg-slate-50 p-3 font-mono text-sm">{generateBooleanQuery(config) || "No valid blocks"}</div></div>
+              <div className="flex flex-wrap items-center justify-between gap-3"><div className="flex flex-wrap items-center gap-3 text-sm"><span>Case-insensitive</span><Switch checked={config.caseInsensitive} onCheckedChange={(checked) => setConfig((current) => ({ ...current, caseInsensitive: checked }))} /><span className="ml-2 font-medium">Search fields:</span>{(["title", "abstract", "keywords"] as const).map((field) => <label key={field} className="flex items-center gap-2 capitalize"><Switch checked={config.searchFields[field]} onCheckedChange={(checked) => setConfig((current) => ({ ...current, searchFields: { ...current.searchFields, [field]: checked } }))} />{field}</label>)}</div><Button onClick={() => setConfig((current) => ({ ...current, blocks: [...current.blocks, { id: uid(), name: `Block ${current.blocks.length + 1}`, terms: [""] }], operators: [...current.operators, "AND"] }))}><Plus className="mr-2 h-4 w-4" />Add block</Button></div>
+              <div className="grid gap-4">{config.blocks.map((block, blockIndex) => <div key={block.id} className={`rounded-xl border p-4 ${block.exclude ? "border-red-200 bg-red-50" : "bg-white"}`}><div className="flex flex-wrap items-center gap-3"><Input value={block.name} className="max-w-xs" onChange={(event) => updateBlock(blockIndex, { name: event.target.value })} /><label className="flex items-center gap-2 text-sm">Regex <Switch checked={!!block.isRegex} onCheckedChange={(checked) => updateBlock(blockIndex, { isRegex: checked })} /></label><label className="flex items-center gap-2 text-sm">Exclude (NOT) <Switch checked={!!block.exclude} onCheckedChange={(checked) => updateBlock(blockIndex, { exclude: checked })} /></label><Button variant="ghost" className="ml-auto text-red-700" onClick={() => setConfig((current) => { const blocks = current.blocks.filter((item) => item.id !== block.id); return { ...current, blocks, operators: Array.from({ length: Math.max(0, blocks.length - 1) }, () => "AND") }; })}><Trash2 className="mr-2 h-4 w-4" />Remove</Button></div><div className="mt-3 grid gap-2">{block.terms.map((term, termIndex) => <div key={termIndex} className="flex gap-2"><Input value={term} placeholder={block.isRegex ? "regular expression" : "literal term or trailing wildcard*"} onChange={(event) => { const terms = [...block.terms]; terms[termIndex] = event.target.value; updateBlock(blockIndex, { terms }); }} /><Button variant="ghost" onClick={() => updateBlock(blockIndex, { terms: block.terms.filter((_, index) => index !== termIndex) })}><Trash2 className="h-4 w-4" /></Button></div>)}<Button variant="outline" onClick={() => updateBlock(blockIndex, { terms: [...block.terms, ""] })}><Plus className="mr-2 h-4 w-4" />Add term</Button></div>{blockIndex < config.blocks.length - 1 && <div className="mt-3 text-center text-xs font-medium text-slate-500">AND — all required blocks must match</div>}</div>)}</div>
+              <GateList items={queryChecklist} />
+              <div className="flex justify-between"><Button variant="outline" onClick={() => setStep("metadata")}>Back</Button><Button disabled={!readyToScreen || running} onClick={runScreening}><Play className="mr-2 h-4 w-4" />{running ? "Screening…" : `Run screening on ${metadataPreview.retainedRecords.length} records`}</Button></div>
+            </CardContent></Card>
           </TabsContent>
-          <TabsContent value="run">
-            <Card className="shadow-sm">
-              <CardContent className="p-6 grid gap-6">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2 text-slate-700">
-                    <Filter className="h-4 w-4" /> Ready to filter
-                  </div>
-                  <div className="flex gap-2">
-                    <Button onClick={run} disabled={running}>
-                      <Play className="h-4 w-4 mr-2" />
-                      {running ? "Running..." : "Execute"}
-                    </Button>
-                    <Button variant="outline" onClick={exportCSV} disabled={!runOutput || runOutput.matched.length === 0}>
-                      <Download className="h-4 w-4 mr-2" />
-                      Export CSV
-                    </Button>
-                    <Button variant="outline" onClick={exportBib} disabled={!runOutput || runOutput.matched.length === 0}>
-                      <Download className="h-4 w-4 mr-2" />
-                      Export .bib
-                    </Button>
-                  </div>
-                </div>
 
-                {runOutput?.report && (
-                  <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
-                    <div className="rounded-2xl border p-4 bg-white shadow-sm">
-                      <div className="text-xs text-slate-500">Total entries</div>
-                      <div className="text-2xl font-semibold">{runOutput.report.total}</div>
-                    </div>
-                    <div className="rounded-2xl border p-4 bg-white shadow-sm">
-                      <div className="text-xs text-slate-500">With selected fields</div>
-                      <div className="text-2xl font-semibold">{runOutput.report.eligible}</div>
-                    </div>
-                    <div className="rounded-2xl border p-4 bg-white shadow-sm border-l-4 border-l-green-500">
-                      <div className="text-xs text-slate-500">Matched</div>
-                      <div className="text-2xl font-semibold text-green-700">{runOutput.report.matched}</div>
-                    </div>
-                    <div className="rounded-2xl border p-4 bg-white shadow-sm border-l-4 border-l-red-500">
-                      <div className="text-xs text-slate-500">Excluded (NOT)</div>
-                      <div className="text-2xl font-semibold text-red-700">{runOutput.report.excluded}</div>
-                    </div>
-                    <div className="rounded-2xl border p-4 bg-white shadow-sm border-l-4 border-l-yellow-500">
-                      <div className="text-xs text-slate-500">Partially matched</div>
-                      <div className="text-2xl font-semibold text-yellow-700">{runOutput.report.partial}</div>
-                    </div>
-                    <div className="rounded-2xl border p-4 bg-white shadow-sm">
-                      <div className="text-xs text-slate-500">Unmatched</div>
-                      <div className="text-2xl font-semibold">{runOutput.report.unmatched}</div>
-                    </div>
-                  </div>
-                )}
-                {runOutput?.termStats && (
-                  <div className="grid gap-4">
-                    <div className="flex items-center justify-between mt-2">
-                      <div className="text-sm text-slate-700 font-medium">Search-term stats (Matched items only)</div>
-                    </div>
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                      <div className="rounded-2xl border p-4 bg-white shadow-sm">
-                        <div className="text-xs text-slate-500">Top term overall</div>
-                        {runOutput.termStats.overallTop.length ? (
-                          <div className="text-lg font-semibold">
-                            {runOutput.termStats.overallTop[0].term}
-                            <span className="ml-2 text-slate-500 text-sm">({runOutput.termStats.overallTop[0].docCount} studies)</span>
-                          </div>
-                        ) : (
-                          <div className="text-slate-500">—</div>
-                        )}
-                        <div className="mt-2 text-xs text-slate-500">Based on unique studies where the term matched in any field.</div>
-                      </div>
-
-                      <div className="rounded-2xl border p-4 bg-white shadow-sm">
-                        <div className="text-xs text-slate-500">Top 3 terms overall</div>
-                        <ul className="mt-1 text-sm">
-                          {runOutput.termStats.overallTop.slice(0, 3).map((t: any, i: number) => (
-                            <li key={i} className="flex justify-between">
-                              <span className="truncate">{t.term}</span>
-                              <span className="text-slate-500">{t.docCount}</span>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-
-                      <div className="rounded-2xl border p-4 bg-white shadow-sm">
-                        <div className="text-xs text-slate-500">Field leaders (overall)</div>
-                        <ul className="mt-1 text-sm">
-                          {(["title", "abstract", "keywords"] as const).map((f) => {
-                            const entries = Object.entries(runOutput.termStats.overallFieldCounts[f] || {}).sort((a: any, b: any) => (b[1] as number) - (a[1] as number));
-                            const top = entries[0];
-                            return (
-                              <li key={f} className="flex justify-between">
-                                <span className="uppercase tracking-wide text-slate-500">{f}:</span>
-                                <span className="truncate ml-2">{top ? `${top[0]} (${top[1]})` : "—"}</span>
-                              </li>
-                            );
-                          })}
-                        </ul>
-                      </div>
-                    </div>
-
-                    <div className="grid gap-3">
-                      {Object.entries(runOutput.termStats.topByBlock).map(([blockName, list]: any) => (
-                        <div key={blockName} className="rounded-2xl border bg-white shadow-sm">
-                          <div className="p-4 border-b flex items-center justify-between">
-                            <div className="text-sm font-medium">{blockName}</div>
-                            {list.length ? (
-                              list.some((t: any) => t.docCount > 0) ? (
-                                <div className="text-xs text-slate-500">
-                                  Leader: <span className="font-medium">{list.find((t: any) => t.docCount === Math.max(...list.map((x: any) => x.docCount)))!.term}</span> (<span className="tabular-nums">{Math.max(...list.map((x: any) => x.docCount))}</span>)
-                                </div>
-                              ) : (
-                                <div className="text-xs text-slate-500">No matches</div>
-                              )
-                            ) : (
-                              <div className="text-xs text-slate-500">No matches</div>
-                            )}
-                          </div>
-                          <div className="p-4 overflow-x-auto">
-                            <table className="w-full text-sm">
-                              <thead>
-                                <tr className="text-left text-xs text-slate-500">
-                                  <th className="py-2 pr-4">Term</th>
-                                  <th className="py-2 pr-4">Studies</th>
-                                  <th className="py-2 pr-4">Title</th>
-                                  <th className="py-2 pr-4">Abstract</th>
-                                  <th className="py-2 pr-4">Keywords</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {list.map((t: any, i: number) => (
-                                  <tr key={i} className="border-t">
-                                    <td className="py-2 pr-4">{t.term}</td>
-                                    <td className="py-2 pr-4 tabular-nums">{t.docCount}</td>
-                                    <td className="py-2 pr-4 tabular-nums">{t.fields.title}</td>
-                                    <td className="py-2 pr-4 tabular-nums">{t.fields.abstract}</td>
-                                    <td className="py-2 pr-4 tabular-nums">{t.fields.keywords}</td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {runOutput && (
-                  <Tabs defaultValue="matched" className="mt-4">
-                    <TabsList>
-                      <TabsTrigger value="matched">Matched ({runOutput.matched.length})</TabsTrigger>
-                      <TabsTrigger value="excluded">Excluded ({runOutput.excluded.length})</TabsTrigger>
-                      <TabsTrigger value="partial">Partially Matched ({runOutput.partial.length})</TabsTrigger>
-                      <TabsTrigger value="unmatched">Unmatched ({runOutput.unmatched.length})</TabsTrigger>
-                    </TabsList>
-                    <TabsContent value="matched" className="mt-4">
-                      <p className="text-sm text-slate-600 mb-4">These entries fully matched the query.</p>
-                      <div className="grid gap-3">
-                        {runOutput.matched.map((r, idx) => {
-                          const titleHTML = highlightByBlocks(r.TitleRaw || r.Title || "", r.MatchedTermsMap, cfg, "title");
-                          const absHTML = highlightByBlocks(r.AbstractRaw || "", r.MatchedTermsMap, cfg, "abstract");
-                          const kwHTML = highlightByBlocks(r.KeywordsRaw || "", r.MatchedTermsMap, cfg, "keywords");
-
-                          return (
-                            <div key={idx} className="rounded-2xl border bg-white p-4 shadow-sm border-l-4 border-l-green-500">
-                              <div className="text-sm text-slate-500 flex items-center gap-2">
-                                <CheckCircle className="h-4 w-4 text-green-600" aria-label="Matched" />
-                                <span>
-                                  {r.CiteKey} · {r.Year}
-                                </span>
-                              </div>
-
-                              <div className="text-lg font-medium leading-snug mt-1" dangerouslySetInnerHTML={{ __html: titleHTML }} />
-
-                              <div className="text-sm text-slate-600 mt-1">{r.Authors}</div>
-                              <div className="text-sm text-slate-600">{r.Venue}</div>
-                              {r.URL && (
-                                <a className="text-sm text-blue-600 underline mt-1 inline-block" href={r.URL} target="_blank" rel="noreferrer">
-                                  Open
-                                </a>
-                              )}
-
-                              {r.AbstractRaw && (
-                                <div className="mt-3">
-                                  <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">Abstract</div>
-                                  <p
-                                    className="text-sm text-slate-700 whitespace-pre-line"
-                                    dangerouslySetInnerHTML={{
-                                      __html: absHTML,
-                                    }}
-                                  />
-                                </div>
-                              )}
-
-                              {r.KeywordsRaw && (
-                                <div className="mt-3">
-                                  <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">Keywords</div>
-                                  <p className="text-sm text-slate-700" dangerouslySetInnerHTML={{ __html: kwHTML }} />
-                                </div>
-                              )}
-
-                              <MatchBreakdown cfg={cfg} matchedMap={r.MatchedTermsMap} />
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </TabsContent>
-                    <TabsContent value="excluded" className="mt-4">
-                      <p className="text-sm text-slate-600 mb-4">These entries were excluded because they matched a NOT (Exclude) block.</p>
-                      <div className="grid gap-3">
-                        {runOutput.excluded.map((r: any, idx: number) => {
-                          const titleHTML = highlightByBlocks(r.TitleRaw || r.Title || "", r.MatchedTermsMap || {}, cfg, "title");
-                          const absHTML = highlightByBlocks(r.AbstractRaw || "", r.MatchedTermsMap || {}, cfg, "abstract");
-                          const kwHTML = highlightByBlocks(r.KeywordsRaw || "", r.MatchedTermsMap || {}, cfg, "keywords");
-
-                          return (
-                            <div key={idx} className="rounded-2xl border bg-white p-4 shadow-sm border-l-4 border-l-red-500">
-                              <div className="text-sm text-slate-500 flex items-center gap-2">
-                                <Ban className="h-4 w-4 text-red-600" aria-label="Excluded" />
-                                <span>
-                                  {r.CiteKey} · {r.Year}
-                                </span>
-                              </div>
-
-                              <div className="text-lg font-medium leading-snug mt-1 opacity-75" dangerouslySetInnerHTML={{ __html: titleHTML }} />
-                              <div className="text-sm text-slate-600 mt-1">{r.Authors}</div>
-
-                              <div className="text-xs text-red-600 font-medium mt-2">Excluded due to matches in: {r.MatchedBlocks}</div>
-
-                              {r.AbstractRaw && (
-                                <div className="mt-3 opacity-75">
-                                  <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">Abstract</div>
-                                  <p className="text-sm text-slate-700 whitespace-pre-line" dangerouslySetInnerHTML={{ __html: absHTML }} />
-                                </div>
-                              )}
-
-                              <MatchBreakdown cfg={cfg} matchedMap={r.MatchedTermsMap} caption="excluded terms" />
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </TabsContent>
-                    <TabsContent value="partial" className="mt-4">
-                      <p className="text-sm text-slate-600 mb-4">These entries had some matching terms but did not satisfy the full query.</p>
-                      <div className="grid gap-3">
-                        {runOutput.partial.map((r: any, idx: number) => {
-                          const titleHTML = highlightByBlocks(r.TitleRaw || r.Title || "", r.MatchedTermsMap || {}, cfg, "title");
-                          const absHTML = highlightByBlocks(r.AbstractRaw || "", r.MatchedTermsMap || {}, cfg, "abstract");
-                          const kwHTML = highlightByBlocks(r.KeywordsRaw || "", r.MatchedTermsMap || {}, cfg, "keywords");
-
-                          return (
-                            <div key={idx} className="rounded-2xl border bg-white p-4 shadow-sm border-l-4 border-l-yellow-500">
-                              <div className="text-sm text-slate-500 flex items-center gap-2">
-                                <HelpCircle className="h-4 w-4 text-yellow-600" aria-label="Partially Matched" />
-                                <span>
-                                  {r.CiteKey} · {r.Year}
-                                </span>
-                              </div>
-
-                              <div className="text-lg font-medium leading-snug mt-1" dangerouslySetInnerHTML={{ __html: titleHTML }} />
-                              <div className="text-sm text-slate-600 mt-1">{r.Authors}</div>
-                              <div className="text-sm text-slate-600">{r.Venue}</div>
-                              {r.URL && (
-                                <a className="text-sm text-blue-600 underline mt-1 inline-block" href={r.URL} target="_blank" rel="noreferrer">
-                                  Open
-                                </a>
-                              )}
-
-                              {r.PartialBlocks && r.PartialBlocks.length > 0 ? (
-                                <div className="text-xs text-slate-500 mt-2">
-                                  Partial matches in: {r.PartialBlocks}
-                                  {r.MissingBlocks ? <> · Missing required blocks: {r.MissingBlocks}</> : null}
-                                </div>
-                              ) : null}
-
-                              {r.AbstractRaw && (
-                                <div className="mt-3">
-                                  <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">Abstract</div>
-                                  <p className="text-sm text-slate-700 whitespace-pre-line" dangerouslySetInnerHTML={{ __html: absHTML }} />
-                                </div>
-                              )}
-                              {r.KeywordsRaw && (
-                                <div className="mt-3">
-                                  <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">Keywords</div>
-                                  <p className="text-sm text-slate-700" dangerouslySetInnerHTML={{ __html: kwHTML }} />
-                                </div>
-                              )}
-
-                              <MatchBreakdown cfg={cfg} matchedMap={r.MatchedTermsMap} caption="partial" />
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </TabsContent>
-                    <TabsContent value="unmatched" className="mt-4">
-                      <p className="text-sm text-slate-600 mb-4">These entries did not match the query.</p>
-                      <div className="grid gap-3">
-                        {runOutput.unmatched.map((r: any, idx: number) => {
-                          const titleHTML = highlightByBlocks(r.TitleRaw || r.Title || "", r.MatchedTermsMap || {}, cfg, "title");
-                          const absHTML = highlightByBlocks(r.AbstractRaw || "", r.MatchedTermsMap || {}, cfg, "abstract");
-                          const kwHTML = highlightByBlocks(r.KeywordsRaw || "", r.MatchedTermsMap || {}, cfg, "keywords");
-
-                          return (
-                            <div key={idx} className="rounded-2xl border bg-white p-4 shadow-sm">
-                              <div className="text-sm text-slate-500 flex items-center gap-2">
-                                <XCircle className="h-4 w-4 text-slate-400" aria-label="Unmatched" />
-                                <span>
-                                  {r.CiteKey} · {r.Year}
-                                </span>
-                              </div>
-
-                              <div className="text-lg font-medium leading-snug mt-1 text-slate-600" dangerouslySetInnerHTML={{ __html: titleHTML }} />
-
-                              <div className="text-sm text-slate-600 mt-1">{r.Authors}</div>
-                              <div className="text-sm text-slate-600">{r.Venue}</div>
-                              {r.URL && (
-                                <a className="text-sm text-blue-600 underline mt-1 inline-block" href={r.URL} target="_blank" rel="noreferrer">
-                                  Open
-                                </a>
-                              )}
-
-                              {r.AbstractRaw && (
-                                <div className="mt-3">
-                                  <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">Abstract</div>
-                                  <p className="text-sm text-slate-700 whitespace-pre-line" dangerouslySetInnerHTML={{ __html: absHTML }} />
-                                </div>
-                              )}
-
-                              {r.KeywordsRaw && (
-                                <div className="mt-3">
-                                  <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">Keywords</div>
-                                  <p className="text-sm text-slate-700" dangerouslySetInnerHTML={{ __html: kwHTML }} />
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </TabsContent>
-                  </Tabs>
-                )}
-
-                {!runOutput && <div className="text-sm text-slate-500">Run the query to see a summarized report, search-term stats, and the matching references.</div>}
-              </CardContent>
-            </Card>
+          <TabsContent value="results">
+            <Card><CardContent className="grid gap-5 p-5 md:p-6">
+              <div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="text-xl font-semibold">Results and audit exports</h2><p className="text-sm text-slate-600">Automatic pre-full-text cleanup and screening results from the last successful run.</p></div><div className="flex flex-wrap gap-2"><Button disabled={resultsStale || !runOutput || generatingWorkbook} onClick={() => void exportWorkbook()}><FileSpreadsheet className="mr-2 h-4 w-4" />{generatingWorkbook ? "Generating workbook…" : "Download complete workbook"}</Button><Button variant="outline" disabled={resultsStale || !runOutput?.keptRecords.length || generatingWorkbook} onClick={() => { if (!runOutput) return; download("matches.bib", buildUniqueBibtex(runOutput.keptRecords).bibtex); }}><FileText className="mr-2 h-4 w-4" />Kept .bib</Button></div></div>
+              {resultsStale && <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">These results are out of date because an upstream input or decision changed. Review the gated steps and run screening again; exports are disabled.</div>}
+              {workbookError && <div role="alert" className="rounded-xl border border-red-300 bg-red-50 p-3 text-sm text-red-900">{workbookError}</div>}
+              {runOutput ? <>
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4 lg:grid-cols-7">{[
+                  ["Entry headers", runOutput.entryHeaders], ["Structurally valid", runOutput.structurallyValid], ["Duplicates removed", runOutput.duplicateAudit.length], ["Metadata removed", runOutput.metadataRemovals.length], ["Screened", runOutput.screenedRecords.length], ["Kept", runOutput.kept.length], ["Excluded", runOutput.excluded.length],
+                ].map(([label, value]) => <div key={String(label)} className="rounded-xl border bg-white p-3"><div className="text-xs text-slate-500">{label}</div><div className="text-2xl font-semibold">{value}</div></div>)}</div>
+                <ResultsPreview kept={runOutput.kept} excluded={runOutput.excluded} blocks={runOutput.blocks} stale={resultsStale} />
+                <details className="rounded-xl border bg-white p-4"><summary className="cursor-pointer font-medium">Matched-term statistics ({runOutput.termCounts.length})</summary><div className="mt-3 grid gap-2 md:grid-cols-2 lg:grid-cols-3">{runOutput.termCounts.map((item) => <div key={item.term} className="flex justify-between rounded-lg border px-3 py-2 text-sm"><span>{item.term}</span><span className="font-medium">{item.count}</span></div>)}</div></details>
+              </> : <div className="rounded-xl border p-8 text-center text-slate-500">Complete the preceding steps and run screening to create results.</div>}
+            </CardContent></Card>
           </TabsContent>
         </Tabs>
-
-        <footer className="text-center text-xs text-slate-500 py-4">Built for visual, block-based literature filtering. Paste a Boolean query to auto-build blocks, tweak AND/OR/NOT, then execute.</footer>
       </div>
     </div>
   );

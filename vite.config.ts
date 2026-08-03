@@ -11,4 +11,13 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules/@codemirror") || id.includes("node_modules/@uiw/react-codemirror") || id.includes("node_modules/codemirror")) return "source-editor";
+        },
+      },
+    },
+  },
 });
